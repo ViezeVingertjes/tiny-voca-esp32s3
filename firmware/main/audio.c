@@ -130,6 +130,13 @@ void audio_play(int16_t *pcm, int n) {
     xQueueSend(queue, &c, portMAX_DELAY);
 }
 
+int audio_set_volume(int volume) {
+    if (!codec) return -1;
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    return wr(codec, 0x32, volume == 0 ? 0 : volume * 256 / 100 - 1) ? -1 : 0;
+}
+
 int audio_pending(void) { return queue ? (int)uxQueueMessagesWaiting(queue) : 0; }
 
 void audio_beep(int hz, int ms) {

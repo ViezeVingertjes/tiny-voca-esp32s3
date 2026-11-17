@@ -3,6 +3,7 @@
 // the console as base64 ("TVDUMP" blocks, decoded by esp32/tools/serial_dump.py).
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
@@ -308,7 +309,7 @@ static void run(void *arg) {
     t = esp_timer_get_time();
     if (!pdata || tvp_init(pdata, psize)) printf("phonemizer not available: %s\n", pdata ? tvp_error() : "no partition");
     else printf("phonemizer ready in %.1f ms\n", (esp_timer_get_time() - t) / 1000.0);
-    if (audio_init(70) == 0) audio_beep(880, 120);
+    if (audio_init(30) == 0) audio_beep(880, 120);
     printf("free PSRAM %u (largest block %u), internal %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     have_test = tdata && !tv_file_open(&test, tdata, tsize);
@@ -324,7 +325,10 @@ static void run(void *arg) {
         else if (!strcmp(line, "mmbench")) mmbench();
         else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
         else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
-        else if (!strncmp(line, "vol ", 4)) printf("volume: re-run audio init not supported yet\n");
+        else if (!strncmp(line, "vol ", 4)) {
+            int v = atoi(line + 4);
+            printf(audio_set_volume(v) ? "volume: codec not available\n" : "volume %d%%\n", v < 0 ? 0 : v > 100 ? 100 : v);
+        }
         else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only
             static int32_t ids[512], st[512];
             int n = tvp_phonemize(line + 5, ids, st, 512);

@@ -10,7 +10,7 @@
 #include "freertos/task.h"
 
 void dot_rows_s8_accx(const int8_t *x, const int8_t *W, int32_t *out, int N, int k16);
-void qacc_mm_s8(const int8_t *x, const int8_t *wblk, uint8_t *raw, int k32);
+void qacc_mm_s8(const int8_t *x, const int8_t *wblk, const uint8_t *raw_in, uint8_t *raw_out, int k32);
 
 uint64_t tv_time_us(void) { return (uint64_t)esp_timer_get_time(); }
 
@@ -54,31 +54,42 @@ static inline void unpack_qacc(const uint8_t *raw, int32_t *o) {
     }
 }
 
-// Backend data per linear: packed preloads [chunks][Npad/16][64 bytes] (or NULL = zeros).
+// Backend data per linear: packed preloads [chunks][Npad/16][64 bytes] and the same values
+// unpacked [chunks][Npad] (NULL when there is no preload), and the per-channel output scale.
 typedef struct {
     uint8_t *raw_pre;
+    int32_t *pre;
+    float *scale;               // in_scale * ws[n]
 } backend;
+
+static const uint8_t zero_raw[64] __attribute__((aligned(16))) = {0};
 
 int tv_linear_prepare(tv_linear *L) {
     if (L->K % (32 * L->chunks)) return -1;
-    if (!L->pre) { L->backend = NULL; return 0; }
     int nblocks = (L->N + 15) / 16;
     backend *b = calloc(1, sizeof *b);
-    b->raw_pre = heap_caps_aligned_alloc(16, (size_t)L->chunks * nblocks * 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!b->raw_pre) return -1;
-    for (int c = 0; c < L->chunks; c++)
-        for (int nb = 0; nb < nblocks; nb++) {
-            int32_t v[16] = {0};
-            for (int j = 0; j < 16 && nb * 16 + j < L->N; j++) v[j] = L->pre[c * L->N + nb * 16 + j];
-            pack_qacc(v, b->raw_pre + ((size_t)c * nblocks + nb) * 64);
-        }
+    if (!b) return -1;
+    b->scale = heap_caps_malloc((size_t)nblocks * 16 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!b->scale) return -1;
+    for (int n = 0; n < nblocks * 16; n++) b->scale[n] = n < L->N ? L->in_scale * L->ws[n] : 0.0f;
+    if (L->pre) {
+        b->raw_pre = heap_caps_aligned_alloc(16, (size_t)L->chunks * nblocks * 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        b->pre = heap_caps_malloc((size_t)L->chunks * nblocks * 16 * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!b->raw_pre || !b->pre) return -1;
+        for (int c = 0; c < L->chunks; c++)
+            for (int nb = 0; nb < nblocks; nb++) {
+                int32_t *v = b->pre + ((size_t)c * nblocks + nb) * 16;
+                for (int j = 0; j < 16; j++) v[j] = nb * 16 + j < L->N ? L->pre[c * L->N + nb * 16 + j] : 0;
+                pack_qacc(v, b->raw_pre + ((size_t)c * nblocks + nb) * 64);
+            }
+    }
     L->backend = b;
     return 0;
 }
 
 void tv_linear_release(tv_linear *L) {
     backend *b = L->backend;
-    if (b) { heap_caps_free(b->raw_pre); free(b); }
+    if (b) { heap_caps_free(b->raw_pre); heap_caps_free(b->pre); heap_caps_free(b->scale); free(b); }
     L->backend = NULL;
 }
 
@@ -86,51 +97,63 @@ void tv_linear_release(tv_linear *L) {
 typedef struct {
     const tv_linear *L;
     const int8_t *x;
-    int32_t *acc;
+    float *y;
     int T, nb0, nb1;
     long saturations;
 } mm_job;
 
-static void mm_run(mm_job *j) {
-    static const uint8_t zero[64] __attribute__((aligned(16))) = {0};
+static void mm_run(void *arg) {
+    mm_job *j = arg;
     const tv_linear *L = j->L;
     const backend *be = L->backend;
     const int K = L->K, N = L->N, chunk = K / L->chunks, nblocks = (N + 15) / 16;
     uint8_t raw[64] __attribute__((aligned(16)));
-    int32_t lanes[16], pre[16], total[16];
+    int32_t lanes[16], total[16];
     long sat = 0;
     for (int nb = j->nb0; nb < j->nb1; nb++) {
         const int8_t *wb = L->wq + (size_t)nb * K * 16;
-        int width = N - nb * 16 < 16 ? N - nb * 16 : 16;
+        const int width = N - nb * 16 < 16 ? N - nb * 16 : 16;
+        const float *scale = be->scale + nb * 16, *bias = L->bias + nb * 16;
         for (int t = 0; t < j->T; t++) {
             const int8_t *xt = j->x + (size_t)t * K;
             for (int c = 0; c < L->chunks; c++) {
-                const uint8_t *init = be ? be->raw_pre + ((size_t)c * nblocks + nb) * 64 : zero;
-                memcpy(raw, init, 64);
-                qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, raw, chunk / 32);
+                const uint8_t *init = be->raw_pre ? be->raw_pre + ((size_t)c * nblocks + nb) * 64 : zero_raw;
+                qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, init, raw, chunk / 32);
                 unpack_qacc(raw, lanes);
-                if (be) unpack_qacc(init, pre); else memset(pre, 0, sizeof pre);
+                const int32_t *pre = be->pre ? be->pre + ((size_t)c * nblocks + nb) * 16 : NULL;
                 for (int i = 0; i < width; i++) {
-                    if (lanes[i] == TV_QACC_MAX || lanes[i] == -TV_QACC_MAX - 1) sat++;
-                    total[i] = (c ? total[i] : 0) + lanes[i] - pre[i];
+                    int32_t v = lanes[i];
+                    sat += v == TV_QACC_MAX || v == -TV_QACC_MAX - 1;
+                    total[i] = (c ? total[i] : 0) + v - (pre ? pre[i] : 0);
                 }
             }
-            memcpy(j->acc + (size_t)t * N + nb * 16, total, width * sizeof(int32_t));
+            float *yt = j->y + (size_t)t * N + nb * 16;
+            for (int i = 0; i < width; i++) yt[i] = (float)total[i] * scale[i] + bias[i];
         }
     }
     j->saturations = sat;
 }
 
 static SemaphoreHandle_t go_sem, done_sem;
-static mm_job *worker_job;
+static void (*worker_fn)(void *);
+static void *worker_arg;
 
 static void worker(void *unused) {
     for (;;) {
         xSemaphoreTake(go_sem, portMAX_DELAY);
-        mm_run(worker_job);
+        worker_fn(worker_arg);
         xSemaphoreGive(done_sem);
     }
 }
+
+void tv_parallel2(void (*fn)(void *), void *a, void *b) {
+    worker_fn = fn;
+    worker_arg = b;
+    xSemaphoreGive(go_sem);
+    fn(a);
+    xSemaphoreTake(done_sem, portMAX_DELAY);
+}
+
 
 void tv_kernels_init(void) {
     if (go_sem) return;
@@ -139,19 +162,16 @@ void tv_kernels_init(void) {
     xTaskCreatePinnedToCore(worker, "tv_worker", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 1);
 }
 
-long tv_matmul_i8(const tv_linear *L, const int8_t *x, int T, int32_t *acc) {
+long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y) {
     int nblocks = (L->N + 15) / 16;
     if (nblocks < 2) {
-        mm_job j = {L, x, acc, T, 0, nblocks, 0};
+        mm_job j = {L, x, y, T, 0, nblocks, 0};
         mm_run(&j);
         return j.saturations;
     }
     int split = nblocks / 2;
-    mm_job a = {L, x, acc, T, 0, split, 0}, b = {L, x, acc, T, split, nblocks, 0};
-    worker_job = &b;
-    xSemaphoreGive(go_sem);
-    mm_run(&a);
-    xSemaphoreTake(done_sem, portMAX_DELAY);
+    mm_job a = {L, x, y, T, 0, split, 0}, b = {L, x, y, T, split, nblocks, 0};
+    tv_parallel2(mm_run, &a, &b);
     return a.saturations + b.saturations;
 }
 

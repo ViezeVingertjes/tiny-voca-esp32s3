@@ -25,10 +25,10 @@ dot_rows_s8_accx:
     bnez a5, .Lrows_n
     retw
 
-// void qacc_mm_s8(const int8_t *x, const int8_t *wblk, uint8_t *raw, int k32)
-// 16 outputs: QACC is loaded from raw (64-byte layout: QACC_L low128, high32, QACC_H low128,
+// void qacc_mm_s8(const int8_t *x, const int8_t *wblk, const uint8_t *raw_in, uint8_t *raw_out, int k32)
+// 16 outputs: QACC is loaded from raw_in (64-byte layout: QACC_L low128, high32, QACC_H low128,
 // high32, each in a 16-byte slot), QACC[j] += sum_k wblk[k*16+j] * x[k] for K = 32*k32,
-// then stored back to raw. Weights loaded 3 instructions ahead, inputs one chunk ahead.
+// then stored to raw_out. Weights loaded 3 instructions ahead, inputs one chunk ahead.
     .align 4
     .global qacc_mm_s8
     .type qacc_mm_s8, @function
@@ -43,7 +43,7 @@ qacc_mm_s8:
     ee.vld.128.ip q1, a3, 16
     ee.vld.128.ip q2, a3, 16
     ee.vld.128.ip q3, a3, 16
-    loopnez a5, .Lmm_end
+    loopnez a6, .Lmm_end
     ee.vsmulas.s8.qacc.ld.incp q4, a3, q1, q0, 0
     ee.vld.128.ip q5, a2, 16
     ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 1
@@ -79,8 +79,8 @@ qacc_mm_s8:
     ee.vsmulas.s8.qacc.ld.incp q2, a3, q3, q5, 14
     ee.vsmulas.s8.qacc.ld.incp q3, a3, q4, q5, 15
 .Lmm_end:
-    ee.st.qacc_l.l.128.ip a4, 16
-    ee.st.qacc_l.h.32.ip a4, 16
-    ee.st.qacc_h.l.128.ip a4, 16
-    ee.st.qacc_h.h.32.ip a4, 16
+    ee.st.qacc_l.l.128.ip a5, 16
+    ee.st.qacc_l.h.32.ip a5, 16
+    ee.st.qacc_h.l.128.ip a5, 16
+    ee.st.qacc_h.h.32.ip a5, 16
     retw

@@ -26,7 +26,7 @@ void tv_kernels_init(void) {}
 int tv_linear_prepare(tv_linear *L) { (void)L; return 0; }
 void tv_linear_release(tv_linear *L) { (void)L; }
 
-long tv_matmul_i8(const tv_linear *L, const int8_t *x, int T, int32_t *acc) {
+long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y) {
     long saturations = 0;
     int K = L->K, chunk = K / L->chunks;
     for (int t = 0; t < T; t++) {
@@ -43,11 +43,13 @@ long tv_matmul_i8(const tv_linear *L, const int8_t *x, int T, int32_t *acc) {
                 }
                 total += run - pre;
             }
-            acc[(size_t)t * L->N + n] = total;
+            y[(size_t)t * L->N + n] = (float)total * (L->in_scale * L->ws[n]) + L->bias[n];
         }
     }
     return saturations;
 }
+
+void tv_parallel2(void (*fn)(void *), void *a, void *b) { fn(a); fn(b); }
 
 void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out) {
     for (int n = 0; n < N; n++) {

@@ -178,12 +178,15 @@ static void on_audio(void *user, const float *x, int n) {
     }
 }
 
+static int profiling = 0;
+
 // One piece of text: phonemize, synthesize, queue for playback. Splits at clauses when too long.
 static int say_piece(char *text, int voice, unsigned seed, int depth) {
     static int32_t ids[512], stress[512];
     int n = tvp_phonemize(text, ids, stress, 512);
     if (n == -2 || n > 0) {
         stream_state st = {0};
+        tv_profile_reset();
         tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st};
         tv_result r;
         int64_t t0 = esp_timer_get_time();
@@ -194,6 +197,7 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
             printf("  [%d phonemes, %d frames, %.2f s audio in %.2f s, RTF %.2f, peak %.2f] %s\n", n, r.n_frames,
                    audio_ms / 1000, ms / 1000, audio_ms / ms, st.peak, text);
             tv_free(r.durations);
+            if (profiling) tv_profile_report();
             return 0;
         }
         if (rc != TV_TOO_LONG) { printf("  synthesis failed (%d): %s\n", rc, text); return -1; }
@@ -270,6 +274,7 @@ static void run(void *arg) {
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
         else if (!strcmp(line, "TEST")) run_test();
         else if (!strcmp(line, "beep")) audio_beep(880, 300);
+        else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
         else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
         else if (!strncmp(line, "vol ", 4)) printf("volume: re-run audio init not supported yet\n");
         else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only

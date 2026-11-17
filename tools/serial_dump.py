@@ -7,6 +7,7 @@ import base64, signal, struct, sys, time
 import serial
 
 port, timeout, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+send = sys.argv[4].encode() + b"\n" if len(sys.argv) > 4 else None     # command to send once READY
 
 
 def bail(*_):
@@ -20,9 +21,15 @@ signal.alarm(int(timeout))
 s = None
 while s is None:
     try:
-        s = serial.Serial(port, 115200, timeout=0.2)
+        s = serial.Serial()
+        s.port, s.baudrate, s.timeout = port, 115200, 0.2
+        s.dtr = s.rts = False
+        s.open()
     except Exception:
+        s = None
         time.sleep(0.2)
+if send:
+    s.write(b"\n")
 
 dumps, current, chunks, pending = {}, None, [], b""
 stop = (b"TVDUMP_DONE", b"tv: finished", b"Guru Meditation", b"Rebooting...", b"abort() was called")
@@ -41,6 +48,9 @@ while not done:
     while b"\n" in pending:
         raw, pending = pending.split(b"\n", 1)
         line = raw.decode(errors="replace").rstrip("\r")
+        if send and line.endswith("READY"):
+            s.write(send); send = None
+            continue
         if line.startswith("TVDUMP_END"):
             name, rows, cols = current or ("?", 0, 0)
             dumps[name] = (base64.b64decode("".join(chunks)), rows, cols)

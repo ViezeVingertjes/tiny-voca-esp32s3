@@ -138,10 +138,44 @@ static void run_syn(char *line) {
     printf("DONE\n");
 }
 
-// Frames that fit in the free PSRAM (peak use is in the vocoder, ~19 KB per frame).
+// Frames that fit in the free PSRAM: ~2.7 KB per frame at the peak (tiled stacks, streaming
+// vocoder) plus ~0.7 MB of fixed tile and vocoder buffers; the largest single buffer is
+// T x 768 bytes. The model itself handles at most 3000 frames.
 static int frame_budget(void) {
-    long free_bytes = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 256 * 1024;
-    return free_bytes > 0 ? (int)(free_bytes / 19500) : 0;
+    long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - 1200 * 1024;
+    long largest = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 64 * 1024;
+    long frames = total / 2900;
+    if (largest / 800 < frames) frames = largest / 800;
+    if (frames > 3000) frames = 3000;
+    return frames > 0 ? (int)frames : 0;
+}
+
+// Streams synthesized audio to the speaker in 0.2 s chunks (clipped at +-0.99).
+typedef struct {
+    int16_t *chunk;
+    int fill;
+    float peak;
+} stream_state;
+
+#define STREAM_CHUNK 4800
+
+static void stream_flush(stream_state *st) {
+    if (!st->fill) return;
+    audio_play(st->chunk, st->fill);                 // the player frees it
+    st->chunk = NULL;
+    st->fill = 0;
+}
+
+static void on_audio(void *user, const float *x, int n) {
+    stream_state *st = user;
+    for (int i = 0; i < n; i++) {
+        if (!st->chunk) st->chunk = tv_alloc(STREAM_CHUNK * 2);
+        float v = x[i];
+        if (fabsf(v) > st->peak) st->peak = fabsf(v);
+        v = v > 0.99f ? 0.99f : v < -0.99f ? -0.99f : v;
+        st->chunk[st->fill++] = (int16_t)lrintf(v * 32767.0f);
+        if (st->fill == STREAM_CHUNK) stream_flush(st);
+    }
 }
 
 // One piece of text: phonemize, synthesize, queue for playback. Splits at clauses when too long.
@@ -149,20 +183,17 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
     static int32_t ids[512], stress[512];
     int n = tvp_phonemize(text, ids, stress, 512);
     if (n == -2 || n > 0) {
-        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget()};
+        stream_state st = {0};
+        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st};
         tv_result r;
         int64_t t0 = esp_timer_get_time();
         int rc = n > 0 ? tv_synthesize(&model, ids, stress, n, voice, &opt, &r) : TV_TOO_LONG;
         if (rc == 0) {
+            stream_flush(&st);
             double ms = (esp_timer_get_time() - t0) / 1000.0, audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
-            float peak = 0;
-            for (int i = 0; i < r.n_samples; i++) if (fabsf(r.audio[i]) > peak) peak = fabsf(r.audio[i]);
-            float gain = 32767.0f * (peak > 0.99f ? 0.99f / peak : 1.0f);
-            int16_t *pcm = tv_alloc((size_t)r.n_samples * 2);
-            for (int i = 0; i < r.n_samples; i++) pcm[i] = (int16_t)lrintf(r.audio[i] * gain);
-            printf("  [%d phonemes, %.2f s audio in %.2f s, RTF %.2f] %s\n", n, audio_ms / 1000, ms / 1000, audio_ms / ms, text);
-            tv_free(r.audio); tv_free(r.durations);
-            audio_play(pcm, r.n_samples);
+            printf("  [%d phonemes, %d frames, %.2f s audio in %.2f s, RTF %.2f, peak %.2f] %s\n", n, r.n_frames,
+                   audio_ms / 1000, ms / 1000, audio_ms / ms, st.peak, text);
+            tv_free(r.durations);
             return 0;
         }
         if (rc != TV_TOO_LONG) { printf("  synthesis failed (%d): %s\n", rc, text); return -1; }

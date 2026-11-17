@@ -83,6 +83,9 @@ int tv_model_init(tv_model *m, const void *data, size_t size);   // 0 on success
 void tv_model_free(tv_model *m);
 
 // ---------------------------------------------------------------- inference
+// Audio sink for streaming output: called with consecutive chunks of samples.
+typedef void (*tv_audio_fn)(void *user, const float *samples, int n);
+
 // Debug hook: called with intermediate tensors (names as in the golden dump).
 typedef void (*tv_debug_fn)(void *user, const char *name, int dtype, const void *data, int rows, int cols);
 
@@ -92,6 +95,8 @@ typedef struct {
     uint32_t seed;
     const int32_t *force_durations; // NULL: predicted
     int max_frames;                 // > 0: return TV_TOO_LONG instead of synthesizing more frames
+    tv_audio_fn on_audio;           // set: audio is streamed here and tv_result.audio stays NULL
+    void *audio_user;
     tv_debug_fn debug;
     void *debug_user;
 } tv_options;
@@ -107,7 +112,8 @@ typedef struct {
 int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, int n_tokens, int voice,
                   const tv_options *opt, tv_result *out);
 
-// Last stage alone: acoustic features [T][192] + prosody [T][3] -> audio [T*hop]. Returns saturations.
+// Last stage alone: acoustic features [T][192] + prosody [T][3] -> audio [T*hop] (or opt->on_audio).
+// Returns saturations.
 long tv_vocode(const tv_model *m, const float *acoustic, const float *prosody, int T, const tv_options *opt, float *audio);
 
 // ---------------------------------------------------------------- profiling (microseconds per op category)
@@ -120,6 +126,8 @@ void tv_profile_report(void);       // printf, one line per category
 #define TV_PROF(id, stmt) do { uint64_t tv_t0_ = tv_time_us(); stmt; tv_prof[id] += tv_time_us() - tv_t0_; } while (0)
 
 // ---------------------------------------------------------------- internals shared with the DSP file
+void tv_vocoder_stream(const float *harmonic, const float *noise_params, const float *f0, const float *noise,
+                       uint64_t seed, int T, tv_audio_fn sink, void *user);
 void tv_vocoder(const float *harmonic /*[T][98]*/, const float *noise_params /*[T][36]*/, const float *f0 /*[T]*/,
                 const float *noise /*[T*hop]*/, int T, float *audio /*[T*hop]*/);
 

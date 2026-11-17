@@ -273,164 +273,211 @@ static void windows3(const float *x, int T, int C, float *y) {
         }
 }
 
-static void rotary(int T, float *cos_t, float *sin_t) {
+// Rotary tables for positions t0 .. t0+rows-1.
+static void rotary_rows(int t0, int rows, float *cos_t, float *sin_t) {
     const int half = TV_HEAD_DIM / 2;
     for (int i = 0; i < half; i++) {
         float inv = 1.0f / powf(10000.0f, (float)(2 * i) / (float)TV_HEAD_DIM);
-        for (int t = 0; t < T; t++) {
-            float a = (float)t * inv;
+        for (int t = 0; t < rows; t++) {
+            float a = (float)(t0 + t) * inv;
             cos_t[t * half + i] = cosf(a);
             sin_t[t * half + i] = sinf(a);
         }
     }
 }
 
-// Scratch buffers for one stack pass over T positions.
+// ---------------------------------------------------------------- tiled transformer stack
+// Each block runs over row tiles of TV_TILE positions. Only the residual stream (the caller's
+// buffer) and the int8 queries, keys (per head) and values (per head, transposed) span the whole
+// utterance: about 0.6 KB per position here plus the residual, instead of ~10 KB untiled.
+#define TV_TILE 64
+
+typedef struct {                    // a debug tensor assembled from tiles (debug runs only)
+    uint8_t *data;
+} dbg_buf;
+
+static void dbg_tile(ctx *c, dbg_buf *d, const char *name, int dtype, const void *tile, int row0, int rows, int cols, int T) {
+    if (!c->opt->debug) return;
+    int es = dtype == TV_I8 ? 1 : 4;
+    if (!d->data) d->data = xmalloc((size_t)T * cols * es);
+    memcpy(d->data + (size_t)row0 * cols * es, tile, (size_t)rows * cols * es);
+    if (row0 + rows == T) {
+        dbg(c, name, dtype, d->data, T, cols);
+        tv_free(d->data);
+        d->data = NULL;
+    }
+}
+
 typedef struct {
-    float *x, *h, *qkv, *y, *cos_t, *sin_t, *scores;
-    int8_t *q8, *k8, *v8, *i8, *kh, *vt, *w8;
-    int32_t *acc, *wts;
-    int tpad;                   // T rounded up to 16 (V^T row length)
+    int T, tpad;
+    int8_t *q8;                     // [T][192]
+    int8_t *kh;                     // [heads][T][48]
+    int8_t *vt;                     // [heads][48][tpad]
+    int8_t *w8;                     // [tpad] attention weights of one query
+    int32_t *wts;                   // [T] dot products of one query
+    float *h, *qkv, *y, *ln2, *cos_t, *sin_t;   // tile buffers
+    int8_t *i8;
+    int32_t *acc;
+    dbg_buf d_ln1, d_attn, d_dw, d_pre, d_gelu;
 } scratch;
 
 static void scratch_alloc(scratch *s, int T) {
-    s->h = xmalloc((size_t)T * TV_FF * sizeof(float));
-    s->qkv = xmalloc((size_t)T * 3 * TV_C * sizeof(float));
-    s->y = xmalloc((size_t)T * TV_C * sizeof(float));
-    s->cos_t = xmalloc((size_t)T * TV_HEAD_DIM / 2 * sizeof(float));
-    s->sin_t = xmalloc((size_t)T * TV_HEAD_DIM / 2 * sizeof(float));
-    s->scores = xmalloc((size_t)T * sizeof(float));
-    s->wts = xmalloc((size_t)T * sizeof(int32_t));
-    s->q8 = xmalloc((size_t)T * TV_C);
-    s->k8 = xmalloc((size_t)T * TV_C);
-    s->v8 = xmalloc((size_t)T * TV_C);
-    s->i8 = xmalloc((size_t)T * TV_FF);
-    s->acc = xmalloc((size_t)T * TV_FF * sizeof(int32_t));
+    memset(s, 0, sizeof *s);
+    s->T = T;
     s->tpad = (T + 15) / 16 * 16;
-    s->kh = xmalloc((size_t)T * TV_HEAD_DIM);
-    s->vt = xmalloc((size_t)TV_HEAD_DIM * s->tpad);
-    s->w8 = xmalloc((size_t)s->tpad);
+    s->q8 = xmalloc((size_t)T * TV_C);
+    s->kh = xmalloc((size_t)TV_HEADS * T * TV_HEAD_DIM);
+    s->vt = xmalloc((size_t)TV_HEADS * TV_HEAD_DIM * s->tpad);
+    memset(s->vt, 0, (size_t)TV_HEADS * TV_HEAD_DIM * s->tpad);         // padding columns stay 0
+    s->w8 = xmalloc(s->tpad);
+    memset(s->w8, 0, s->tpad);
+    s->wts = xmalloc((size_t)T * sizeof(int32_t));
+    s->h = xmalloc((size_t)TV_TILE * TV_FF * sizeof(float));
+    s->qkv = xmalloc((size_t)TV_TILE * 3 * TV_C * sizeof(float));
+    s->y = xmalloc((size_t)TV_TILE * TV_C * sizeof(float));
+    s->ln2 = xmalloc((size_t)(TV_TILE + 6) * TV_C * sizeof(float));
+    s->cos_t = xmalloc((size_t)TV_TILE * TV_HEAD_DIM / 2 * sizeof(float));
+    s->sin_t = xmalloc((size_t)TV_TILE * TV_HEAD_DIM / 2 * sizeof(float));
+    s->i8 = xmalloc((size_t)TV_TILE * TV_FF);
+    s->acc = xmalloc((size_t)TV_TILE * TV_FF * sizeof(int32_t));
 }
 
 static void scratch_free(scratch *s) {
-    tv_free(s->h); tv_free(s->qkv); tv_free(s->y); tv_free(s->cos_t); tv_free(s->sin_t); tv_free(s->scores); tv_free(s->wts);
-    tv_free(s->q8); tv_free(s->k8); tv_free(s->v8); tv_free(s->i8); tv_free(s->acc);
-    tv_free(s->kh); tv_free(s->vt); tv_free(s->w8);
+    tv_free(s->q8); tv_free(s->kh); tv_free(s->vt); tv_free(s->w8); tv_free(s->wts);
+    tv_free(s->h); tv_free(s->qkv); tv_free(s->y); tv_free(s->ln2); tv_free(s->cos_t); tv_free(s->sin_t);
+    tv_free(s->i8); tv_free(s->acc);
 }
 
-// Debug view of q/k/v in the golden layout [head][t][dim].
-static void dbg_heads(ctx *c, const char *name, const int8_t *x, int T) {
+// Debug views of q/k/v in the golden layout [head][t][dim].
+static void dbg_qkv(ctx *c, const char *prefix, const scratch *s) {
     if (!c->opt->debug) return;
+    const int T = s->T;
+    char name[96];
     int8_t *tmp = xmalloc((size_t)T * TV_C);
     for (int h = 0; h < TV_HEADS; h++)
         for (int t = 0; t < T; t++)
-            memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, x + (size_t)t * TV_C + h * TV_HEAD_DIM, TV_HEAD_DIM);
-    dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
+            memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, s->q8 + (size_t)t * TV_C + h * TV_HEAD_DIM, TV_HEAD_DIM);
+    snprintf(name, sizeof name, "%s.q", prefix); dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
+    snprintf(name, sizeof name, "%s.k", prefix); dbg(c, name, TV_I8, s->kh, TV_HEADS * T, TV_HEAD_DIM);
+    for (int h = 0; h < TV_HEADS; h++)
+        for (int t = 0; t < T; t++)
+            for (int d = 0; d < TV_HEAD_DIM; d++)
+                tmp[((size_t)h * T + t) * TV_HEAD_DIM + d] = s->vt[((size_t)h * TV_HEAD_DIM + d) * s->tpad + t];
+    snprintf(name, sizeof name, "%s.v", prefix); dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
     tv_free(tmp);
-}
-
-static void attention(ctx *c, const tv_block *b, const char *prefix, const float *xn, int T, scratch *s, float *out) {
-    char name[96];
-    quantize(xn, T * TV_C, b->s_ln1, s->i8);
-    snprintf(name, sizeof name, "%s.ln1", prefix); dbg(c, name, TV_I8, s->i8, T, TV_C);
-    linear_f(c, &b->qkv, s->i8, T, s->acc, s->qkv);
-    const int half = TV_HEAD_DIM / 2;
-    uint64_t t_rope = tv_time_us();
-    for (int t = 0; t < T; t++) {
-        float *row = s->qkv + (size_t)t * 3 * TV_C;
-        for (int part = 0; part < 2; part++)            // rotary on q and k
-            for (int h = 0; h < TV_HEADS; h++) {
-                float *z = row + part * TV_C + h * TV_HEAD_DIM;
-                for (int i = 0; i < half; i++) {
-                    float a = z[2 * i], bb = z[2 * i + 1], cs = s->cos_t[t * half + i], sn = s->sin_t[t * half + i];
-                    z[2 * i] = a * cs - bb * sn;
-                    z[2 * i + 1] = a * sn + bb * cs;
-                }
-            }
-        tv_prof[TV_P_ROPE] += tv_time_us() - t_rope;
-        quantize(row, TV_C, b->s_q, s->q8 + (size_t)t * TV_C);
-        quantize(row + TV_C, TV_C, b->s_k, s->k8 + (size_t)t * TV_C);
-        quantize(row + 2 * TV_C, TV_C, b->s_v, s->v8 + (size_t)t * TV_C);
-        t_rope = tv_time_us();
-    }
-    snprintf(name, sizeof name, "%s.q", prefix); dbg_heads(c, name, s->q8, T);
-    snprintf(name, sizeof name, "%s.k", prefix); dbg_heads(c, name, s->k8, T);
-    snprintf(name, sizeof name, "%s.v", prefix); dbg_heads(c, name, s->v8, T);
-    for (int h = 0; h < TV_HEADS; h++) {
-        int off = h * TV_HEAD_DIM;
-        // This head's keys as contiguous rows [T][48], its values transposed [48][Tpad].
-        memset(s->vt, 0, (size_t)TV_HEAD_DIM * s->tpad);
-        for (int j = 0; j < T; j++) {
-            memcpy(s->kh + (size_t)j * TV_HEAD_DIM, s->k8 + (size_t)j * TV_C + off, TV_HEAD_DIM);
-            for (int d = 0; d < TV_HEAD_DIM; d++) s->vt[(size_t)d * s->tpad + j] = s->v8[(size_t)j * TV_C + off + d];
-        }
-        memset(s->w8, 0, s->tpad);
-        for (int i = 0; i < T; i++) {
-            const int8_t *qi = s->q8 + (size_t)i * TV_C + off;
-            int8_t qrow[TV_HEAD_DIM] __attribute__((aligned(16)));
-            memcpy(qrow, qi, TV_HEAD_DIM);
-            TV_PROF(TV_P_ATTN_DOT, tv_dot_rows_i8(qrow, s->kh, T, TV_HEAD_DIM, s->wts));
-            uint64_t t_soft = tv_time_us();
-            int32_t mx = INT32_MIN;
-            for (int j = 0; j < T; j++) if (s->wts[j] > mx) mx = s->wts[j];
-            // Row-max scaled int8 weights (largest = 127), normalized by their own sum.
-            int32_t sum = 0, acc[TV_HEAD_DIM];
-            const uint8_t *lut = b->softmax_lut;
-            const uint32_t lim = (uint32_t)b->softmax_n;
-            for (int j = 0; j < T; j++) {
-                uint32_t gap = (uint32_t)(mx - s->wts[j]);
-                int32_t w = gap < lim ? lut[gap] : 0;
-                s->w8[j] = (int8_t)w;
-                sum += w;
-            }
-            tv_prof[TV_P_SOFTMAX] += tv_time_us() - t_soft;
-            TV_PROF(TV_P_ATTN_DOT, tv_dot_rows_i8(s->w8, s->vt, TV_HEAD_DIM, s->tpad, acc));
-            float k = b->s_v / (float)sum;
-            for (int d = 0; d < TV_HEAD_DIM; d++) s->y[(size_t)i * TV_C + off + d] = (float)acc[d] * k;
-        }
-    }
-    quantize(s->y, T * TV_C, b->s_attn, s->i8);
-    snprintf(name, sizeof name, "%s.attn", prefix); dbg(c, name, TV_I8, s->i8, T, TV_C);
-    linear_f(c, &b->out, s->i8, T, s->acc, out);
 }
 
 static void block_forward(ctx *c, const tv_block *b, const char *prefix, float *x, int T, scratch *s) {
     char name[96];
-    // x += attention(norm1(x))
-    layer_norm(x, T, TV_C, b->norm1_w, b->norm1_b, s->h);
-    attention(c, b, prefix, s->h, T, s, s->qkv);        // qkv buffer reused for the output
-    for (size_t i = 0; i < (size_t)T * TV_C; i++) x[i] += s->qkv[i];
-    // y = depthwise(norm2(x)), float
-    layer_norm(x, T, TV_C, b->norm2_w, b->norm2_b, s->h);
-    uint64_t t_dw = tv_time_us();
-    for (int t = 0; t < T; t++)
-        for (int ch = 0; ch < TV_C; ch++) {
-            float v = b->dw_b[ch];
-            for (int k = 0; k < TV_KERNEL; k++) {
-                int src = t + k - TV_KERNEL / 2;
-                if (src >= 0 && src < T) v += b->dw_w[ch * TV_KERNEL + k] * s->h[(size_t)src * TV_C + ch];
-            }
-            s->y[(size_t)t * TV_C + ch] = v;
+    const int half = TV_HEAD_DIM / 2;
+    // ---- pass 1: queries, keys and values of every position
+    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
+        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+        layer_norm(x + (size_t)t0 * TV_C, rows, TV_C, b->norm1_w, b->norm1_b, s->h);
+        quantize(s->h, rows * TV_C, b->s_ln1, s->i8);
+        snprintf(name, sizeof name, "%s.ln1", prefix); dbg_tile(c, &s->d_ln1, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        linear_f(c, &b->qkv, s->i8, rows, s->acc, s->qkv);
+        uint64_t t_rope = tv_time_us();
+        rotary_rows(t0, rows, s->cos_t, s->sin_t);
+        for (int r = 0; r < rows; r++) {
+            float *row = s->qkv + (size_t)r * 3 * TV_C;
+            for (int part = 0; part < 2; part++)
+                for (int h = 0; h < TV_HEADS; h++) {
+                    float *z = row + part * TV_C + h * TV_HEAD_DIM;
+                    for (int i = 0; i < half; i++) {
+                        float a = z[2 * i], bb = z[2 * i + 1], cs = s->cos_t[r * half + i], sn = s->sin_t[r * half + i];
+                        z[2 * i] = a * cs - bb * sn;
+                        z[2 * i + 1] = a * sn + bb * cs;
+                    }
+                }
         }
-    tv_prof[TV_P_DW] += tv_time_us() - t_dw;
-    quantize(s->y, T * TV_C, b->s_dw, s->i8);
-    snprintf(name, sizeof name, "%s.dw", prefix); dbg(c, name, TV_I8, s->i8, T, TV_C);
-    // expand -> int8 pre-activation -> GELU table -> project
-    linear_f(c, &b->expand, s->i8, T, s->acc, s->h);
-    int8_t *pre = s->i8;
-    quantize(s->h, T * TV_FF, b->s_pre, pre);
-    snprintf(name, sizeof name, "%s.pre", prefix); dbg(c, name, TV_I8, pre, T, TV_FF);
-    TV_PROF(TV_P_GELU, for (size_t i = 0; i < (size_t)T * TV_FF; i++) pre[i] = b->gelu_lut[pre[i] + 128]);
-    snprintf(name, sizeof name, "%s.gelu", prefix); dbg(c, name, TV_I8, pre, T, TV_FF);
-    linear_f(c, &b->project, pre, T, s->acc, s->y);
-    for (size_t i = 0; i < (size_t)T * TV_C; i++) x[i] += s->y[i];
+        tv_prof[TV_P_ROPE] += tv_time_us() - t_rope;
+        int8_t kq[TV_C], vq[TV_C];
+        for (int r = 0; r < rows; r++) {
+            const float *row = s->qkv + (size_t)r * 3 * TV_C;
+            int t = t0 + r;
+            quantize(row, TV_C, b->s_q, s->q8 + (size_t)t * TV_C);
+            quantize(row + TV_C, TV_C, b->s_k, kq);
+            quantize(row + 2 * TV_C, TV_C, b->s_v, vq);
+            for (int h = 0; h < TV_HEADS; h++) {
+                memcpy(s->kh + ((size_t)h * T + t) * TV_HEAD_DIM, kq + h * TV_HEAD_DIM, TV_HEAD_DIM);
+                for (int d = 0; d < TV_HEAD_DIM; d++) s->vt[((size_t)h * TV_HEAD_DIM + d) * s->tpad + t] = vq[h * TV_HEAD_DIM + d];
+            }
+        }
+    }
+    dbg_qkv(c, prefix, s);
+    // ---- pass 2: attention per query tile, output projection, residual
+    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
+        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+        for (int h = 0; h < TV_HEADS; h++) {
+            const int8_t *kh = s->kh + (size_t)h * T * TV_HEAD_DIM, *vt = s->vt + (size_t)h * TV_HEAD_DIM * s->tpad;
+            for (int r = 0; r < rows; r++) {
+                int8_t qrow[TV_HEAD_DIM] __attribute__((aligned(16)));
+                memcpy(qrow, s->q8 + (size_t)(t0 + r) * TV_C + h * TV_HEAD_DIM, TV_HEAD_DIM);
+                TV_PROF(TV_P_ATTN_DOT, tv_dot_rows_i8(qrow, kh, T, TV_HEAD_DIM, s->wts));
+                uint64_t t_soft = tv_time_us();
+                int32_t mx = INT32_MIN;
+                for (int j = 0; j < T; j++) if (s->wts[j] > mx) mx = s->wts[j];
+                // Row-max scaled int8 weights (largest = 127), normalized by their own sum.
+                int32_t sum = 0, acc[TV_HEAD_DIM];
+                const uint8_t *lut = b->softmax_lut;
+                const uint32_t lim = (uint32_t)b->softmax_n;
+                for (int j = 0; j < T; j++) {
+                    uint32_t gap = (uint32_t)(mx - s->wts[j]);
+                    int32_t w = gap < lim ? lut[gap] : 0;
+                    s->w8[j] = (int8_t)w;
+                    sum += w;
+                }
+                tv_prof[TV_P_SOFTMAX] += tv_time_us() - t_soft;
+                TV_PROF(TV_P_ATTN_DOT, tv_dot_rows_i8(s->w8, vt, TV_HEAD_DIM, s->tpad, acc));
+                float k = b->s_v / (float)sum;
+                for (int d = 0; d < TV_HEAD_DIM; d++) s->y[(size_t)r * TV_C + h * TV_HEAD_DIM + d] = (float)acc[d] * k;
+            }
+        }
+        quantize(s->y, rows * TV_C, b->s_attn, s->i8);
+        snprintf(name, sizeof name, "%s.attn", prefix); dbg_tile(c, &s->d_attn, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        linear_f(c, &b->out, s->i8, rows, s->acc, s->qkv);
+        float *xt = x + (size_t)t0 * TV_C;
+        for (int i = 0; i < rows * TV_C; i++) xt[i] += s->qkv[i];
+    }
+    // ---- pass 3: depthwise conv over LayerNorm2 (3 rows of context), expand, GELU, project
+    float carry[3 * TV_C];                              // LayerNorm2 of the 3 rows before the tile, pre-update
+    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
+        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+        int last = t0 + rows + 3 < T ? t0 + rows + 3 : T;            // LayerNorm rows [t0, last) are fresh
+        // ln2 row r stands for position t0 - 3 + r
+        if (t0 > 0) memcpy(s->ln2, carry, sizeof carry);
+        layer_norm(x + (size_t)t0 * TV_C, last - t0, TV_C, b->norm2_w, b->norm2_b, s->ln2 + 3 * TV_C);
+        if (t0 + rows < T) memcpy(carry, s->ln2 + (size_t)rows * TV_C, sizeof carry);  // positions t0+rows-3 ..
+        uint64_t t_dw = tv_time_us();
+        for (int r = 0; r < rows; r++)
+            for (int ch = 0; ch < TV_C; ch++) {
+                float v = b->dw_b[ch];
+                for (int k = 0; k < TV_KERNEL; k++) {
+                    int src = t0 + r + k - TV_KERNEL / 2;
+                    if (src >= 0 && src < T) v += b->dw_w[ch * TV_KERNEL + k] * s->ln2[(size_t)(src - t0 + 3) * TV_C + ch];
+                }
+                s->y[(size_t)r * TV_C + ch] = v;
+            }
+        tv_prof[TV_P_DW] += tv_time_us() - t_dw;
+        quantize(s->y, rows * TV_C, b->s_dw, s->i8);
+        snprintf(name, sizeof name, "%s.dw", prefix); dbg_tile(c, &s->d_dw, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        linear_f(c, &b->expand, s->i8, rows, s->acc, s->h);
+        int8_t *pre = s->i8;
+        quantize(s->h, rows * TV_FF, b->s_pre, pre);
+        snprintf(name, sizeof name, "%s.pre", prefix); dbg_tile(c, &s->d_pre, name, TV_I8, pre, t0, rows, TV_FF, T);
+        TV_PROF(TV_P_GELU, for (int i = 0; i < rows * TV_FF; i++) pre[i] = b->gelu_lut[pre[i] + 128]);
+        snprintf(name, sizeof name, "%s.gelu", prefix); dbg_tile(c, &s->d_gelu, name, TV_I8, pre, t0, rows, TV_FF, T);
+        linear_f(c, &b->project, pre, rows, s->acc, s->y);
+        float *xt = x + (size_t)t0 * TV_C;
+        for (int i = 0; i < rows * TV_C; i++) xt[i] += s->y[i];
+    }
 }
 
-// x [T][C] is the residual input (overwritten); out receives the final LayerNorm.
+// x [T][C] is the residual input (overwritten); out receives the final LayerNorm (may alias x).
 static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x, int T, float *out) {
     scratch s;
     scratch_alloc(&s, T);
-    TV_PROF(TV_P_ROPE, rotary(T, s.cos_t, s.sin_t));
     char buf[96];
     for (int i = 0; i < st->count; i++) {
         snprintf(buf, sizeof buf, "%s.blocks.%d", name, i);
@@ -438,10 +485,10 @@ static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x
         snprintf(buf, sizeof buf, "%s.%d.out", name, i);
         dbg(c, buf, TV_F32, x, T, TV_C);
     }
+    scratch_free(&s);
     layer_norm(x, T, TV_C, st->norm_w, st->norm_b, out);
     snprintf(buf, sizeof buf, "%s.final", name);
     dbg(c, buf, TV_F32, out, T, TV_C);
-    scratch_free(&s);
 }
 
 static float gelu_f(float x) { return gelu(x); }
@@ -482,13 +529,10 @@ static void predict_durations(ctx *c, const tv_model *m, const float *hidden, co
     tv_free(win); tv_free(h1); tv_free(h2); tv_free(q); tv_free(acc); tv_free(out);
 }
 
-static float gaussian(uint64_t *state) {     // xorshift64* + Box-Muller
-    float u[2];
-    for (int i = 0; i < 2; i++) {
-        *state ^= *state >> 12; *state ^= *state << 25; *state ^= *state >> 27;
-        u[i] = ((float)((*state * 0x2545F4914F6CDD1DULL) >> 40) + 0.5f) / 16777216.0f;
-    }
-    return sqrtf(-2.0f * logf(u[0])) * cosf(6.2831853f * u[1]);
+static void collect_audio(void *user, const float *x, int n) {
+    float **cursor = user;
+    memcpy(*cursor, x, n * sizeof(float));
+    *cursor += n;
 }
 
 long tv_vocode(const tv_model *m, const float *ac, const float *pros, int T, const tv_options *opt, float *audio) {
@@ -506,17 +550,14 @@ long tv_vocode(const tv_model *m, const float *ac, const float *pros, int T, con
         f0[f] = hz < 50.0f ? 50.0f : hz > 600.0f ? 600.0f : hz;
     }
     int S = T * TV_HOP;
-    float *noise = NULL;
-    const float *src = opt->noise;
-    if (!src) {
-        noise = xmalloc((size_t)S * sizeof(float));
-        uint64_t state = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)opt->seed << 1 | 1);
-        for (int i = 0; i < S; i++) noise[i] = gaussian(&state);
-        src = noise;
+    if (opt->on_audio) {
+        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, opt->on_audio, opt->audio_user);
+    } else {
+        float *cursor = audio;
+        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, collect_audio, &cursor);
+        dbg(&c, "audio", TV_F32, audio, 1, S);
     }
-    tv_vocoder(harm, nz, f0, src, T, audio);
-    dbg(&c, "audio", TV_F32, audio, 1, S);
-    tv_free(q); tv_free(harm); tv_free(nz); tv_free(f0); tv_free(acc); tv_free(noise);
+    tv_free(q); tv_free(harm); tv_free(nz); tv_free(f0); tv_free(acc);
     return c.saturations;
 }
 
@@ -584,18 +625,16 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
     dbg(&c, "prosody", TV_F32, pros, T, 3);
     // ---- acoustic
     float *ac = ph;                                     // final LN of the acoustic stack overwrites ph
-    float *ac_res = xmalloc((size_t)T * TV_C * sizeof(float));
-    memcpy(ac_res, ac_in, (size_t)T * TV_C * sizeof(float));
-    stack_forward(&c, &m->acoustic, "acoustic_stack", ac_res, T, ac);
+    stack_forward(&c, &m->acoustic, "acoustic_stack", ac_in, T, ac);
     dbg(&c, "acoustic", TV_F32, ac, T, TV_C);
     // ---- vocoder heads (int8) and source-filter synthesis (float)
     int S = T * TV_HOP;
-    res->audio = xmalloc((size_t)S * sizeof(float));
+    res->audio = opt->on_audio ? NULL : xmalloc((size_t)S * sizeof(float));
     c.saturations += tv_vocode(m, ac, pros, T, opt, res->audio);
     res->n_samples = S;
     res->n_frames = T;
     res->durations = dur;
     res->qacc_saturations = c.saturations;
-    tv_free(x); tv_free(hidden); tv_free(frames); tv_free(ph); tv_free(vowel); tv_free(pros); tv_free(ac_res);
+    tv_free(x); tv_free(hidden); tv_free(frames); tv_free(ph); tv_free(vowel); tv_free(pros);
     return 0;
 }

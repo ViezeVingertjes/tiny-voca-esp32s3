@@ -1,5 +1,7 @@
 # tiny-voca on the ESP32-S3
 
+https://github.com/user-attachments/assets/30e705c4-ce2c-4228-a7ed-4b96ea30050a
+
 Type a sentence, hear it. [tiny-voca](https://github.com/n4ze3m/tiny-voca), a 4.5M-parameter English
 text-to-speech model, running entirely on an ESP32-S3: phonemizer, neural network and speaker.
 No cloud, no computer once it is flashed.

@@ -84,3 +84,26 @@ qacc_mm_s8:
     ee.st.qacc_h.l.128.ip a5, 16
     ee.st.qacc_h.h.32.ip a5, 16
     retw
+
+// void dot48_rows_accx(const int8_t *q, const int8_t *K, int32_t *out, int N)
+// out[n] = dot(q[0:48], K[n*48 : n*48+48]): the query stays in q0..q2, keys stream through
+// q3..q5 with each load issued by the previous multiply. Reads 16 bytes past the last key row.
+    .align 4
+    .global dot48_rows_accx
+    .type dot48_rows_accx, @function
+dot48_rows_accx:
+    entry a1, 32
+    ee.vld.128.ip q0, a2, 16
+    ee.vld.128.ip q1, a2, 16
+    ee.vld.128.ip q2, a2, 16
+    ee.vld.128.ip q3, a3, 16
+    loopnez a5, .Ld48_end
+    ee.zero.accx
+    ee.vmulas.s8.accx.ld.ip q4, a3, 16, q0, q3
+    ee.vmulas.s8.accx.ld.ip q5, a3, 16, q1, q4
+    ee.vmulas.s8.accx.ld.ip q3, a3, 16, q2, q5
+    rur.accx_0 a6
+    s32i a6, a4, 0
+    addi a4, a4, 4
+.Ld48_end:
+    retw

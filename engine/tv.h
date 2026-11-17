@@ -117,7 +117,7 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
 long tv_vocode(const tv_model *m, const float *acoustic, const float *prosody, int T, const tv_options *opt, float *audio);
 
 // ---------------------------------------------------------------- profiling (microseconds per op category)
-enum { TV_P_MATMUL, TV_P_EPILOGUE, TV_P_ATTN_DOT, TV_P_SOFTMAX, TV_P_NORM, TV_P_DW, TV_P_QUANT, TV_P_GELU, TV_P_ROPE,
+enum { TV_P_MATMUL, TV_P_EPILOGUE, TV_P_ATTN_DOT, TV_P_SOFTMAX, TV_P_ATTN_PV, TV_P_NORM, TV_P_DW, TV_P_QUANT, TV_P_GELU, TV_P_ROPE,
        TV_P_VOC_CEP, TV_P_VOC_SHAPE, TV_P_VOC_PULSE, TV_P_COUNT };
 extern uint64_t tv_prof[TV_P_COUNT];
 uint64_t tv_time_us(void);          // provided by the kernel backend

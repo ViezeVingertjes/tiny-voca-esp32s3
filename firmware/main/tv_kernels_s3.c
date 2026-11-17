@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 void dot_rows_s8_accx(const int8_t *x, const int8_t *W, int32_t *out, int N, int k16);
+void dot48_rows_accx(const int8_t *q, const int8_t *K, int32_t *out, int N);
 void qacc_mm_s8(const int8_t *x, const int8_t *wblk, const uint8_t *raw_in, uint8_t *raw_out, int k32);
 
 uint64_t tv_time_us(void) { return (uint64_t)esp_timer_get_time(); }
@@ -173,7 +174,7 @@ void tv_kernels_init(void) {
     if (go_sem) return;
     go_sem = xSemaphoreCreateBinary();
     done_sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(worker, "tv_worker", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 1);
+    xTaskCreatePinnedToCore(worker, "tv_worker", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1);
 }
 
 long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {
@@ -190,5 +191,6 @@ long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const 
 }
 
 void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out) {
+    if (K == 48) { dot48_rows_accx(x, W, out, N); return; }       // attention scores: query held in registers
     dot_rows_s8_accx(x, W, out, N, K / 16);
 }

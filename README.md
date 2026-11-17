@@ -28,7 +28,8 @@ idf.py -p /dev/cu.usbmodem1201 monitor                         # then type a phr
 The data partitions only need writing again when the model or phonemizer data change.
 
 Console commands: any text is spoken; `voice F2` / `voice M2`; `beep`; `prof` (per-op timings);
-`TEST` (golden test vector, prints a TVDUMP for `tools/serial_dump.py`); `PHON <text>` (ids only).
+`TEST` (golden test vector, prints a TVDUMP for `tools/serial_dump.py`); `PHON <text>` (ids only);
+`mmbench` (matmul speed with weights and activations in flash, PSRAM or SRAM).
 On the board everything runs locally: sentence splitting, dizione, synthesis and the speaker.
 A sentence that would not fit in PSRAM (about 1,400 frames, 15 s) is split at commas.
 

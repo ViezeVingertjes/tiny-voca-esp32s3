@@ -200,7 +200,8 @@ void tv_model_free(tv_model *m) {
 
 // ---------------------------------------------------------------- profiling
 uint64_t tv_prof[TV_P_COUNT];
-static const char *const prof_names[TV_P_COUNT] = {"matmul (int8)", "matmul epilogue", "attention dots", "softmax",
+static const char *const prof_names[TV_P_COUNT] = {"matmul (int8)", "matmul epilogue", "attention pass 1 (cpu)",
+    "softmax", "attention pass 2 (cpu)",
     "layernorm", "depthwise conv", "quantize", "gelu table", "rotary", "vocoder cepstrum", "vocoder stft filter",
     "vocoder pulses"};
 void tv_profile_reset(void) { memset(tv_prof, 0, sizeof tv_prof); }
@@ -314,8 +315,7 @@ static void rotary_rows(int t0, int rows, float *cos_t, float *sin_t) {
 // buffer) and the int8 queries, keys (per head) and values (per head, transposed) span the whole
 // utterance: about 0.6 KB per position here plus the residual, instead of ~10 KB untiled.
 #define TV_TILE 64
-#define TV_QT 16                    // queries per attention sub-tile
-#define TV_KCH 128                  // keys per chunk (6 KB of keys stays in cache across the sub-tile)
+#define TV_KCH 128                  // keys per chunk: 6 KB of keys and 6 KB of values stay in cache
 
 typedef struct {                    // a debug tensor assembled from tiles (debug runs only)
     uint8_t *data;
@@ -334,12 +334,11 @@ static void dbg_tile(ctx *c, dbg_buf *d, const char *name, int dtype, const void
 }
 
 typedef struct {
-    int T, tpad;
+    int T, nchunks;                 // nchunks = ceil(T / TV_KCH)
     int8_t *q8;                     // [T][192]
     int8_t *kh;                     // [heads][T][48]
-    int8_t *vt;                     // [heads][48][tpad]
-    int32_t *S[2];                  // [TV_QT][T] dot products of a query tile, one set per core
-    int8_t *W[2];                   // [TV_QT][tpad] attention weights of a query tile
+    int8_t *vt;                     // [heads][nchunks][48][TV_KCH] values, transposed per key chunk
+    int32_t *vacc[2];               // [TV_TILE][48] per core: weighted value sums of one head
     float *cos_t, *sin_t;           // [T][24] rotary tables (whole utterance)
     float *h, *qkv, *y, *ln2;       // tile buffers
     int8_t *i8, *g8;                // tile int8 buffers (matmul input / expand output)
@@ -350,16 +349,13 @@ typedef struct {
 static void scratch_alloc(scratch *s, int T) {
     memset(s, 0, sizeof *s);
     s->T = T;
-    s->tpad = (T + 15) / 16 * 16;
+    s->nchunks = (T + TV_KCH - 1) / TV_KCH;
+    size_t vsize = (size_t)TV_HEADS * s->nchunks * TV_HEAD_DIM * TV_KCH;
     s->q8 = xmalloc((size_t)T * TV_C);
     s->kh = xmalloc((size_t)TV_HEADS * T * TV_HEAD_DIM);
-    s->vt = xmalloc((size_t)TV_HEADS * TV_HEAD_DIM * s->tpad);
-    memset(s->vt, 0, (size_t)TV_HEADS * TV_HEAD_DIM * s->tpad);         // padding columns stay 0
-    for (int i = 0; i < 2; i++) {
-        s->S[i] = xmalloc((size_t)TV_QT * T * sizeof(int32_t));
-        s->W[i] = xmalloc((size_t)TV_QT * s->tpad);
-        memset(s->W[i], 0, (size_t)TV_QT * s->tpad);                    // columns >= T stay 0
-    }
+    s->vt = xmalloc(vsize);
+    memset(s->vt, 0, vsize);                                            // keys past T stay 0
+    for (int i = 0; i < 2; i++) s->vacc[i] = xmalloc((size_t)TV_TILE * TV_HEAD_DIM * sizeof(int32_t));
     s->h = xmalloc((size_t)TV_TILE * TV_FF * sizeof(float));
     s->qkv = xmalloc((size_t)TV_TILE * 3 * TV_C * sizeof(float));
     s->y = xmalloc((size_t)TV_TILE * TV_C * sizeof(float));
@@ -374,9 +370,13 @@ static void scratch_alloc(scratch *s, int T) {
 
 static void scratch_free(scratch *s) {
     tv_free(s->q8); tv_free(s->kh); tv_free(s->vt);
-    for (int i = 0; i < 2; i++) { tv_free(s->S[i]); tv_free(s->W[i]); }
+    for (int i = 0; i < 2; i++) tv_free(s->vacc[i]);
     tv_free(s->h); tv_free(s->qkv); tv_free(s->y); tv_free(s->ln2); tv_free(s->cos_t); tv_free(s->sin_t);
     tv_free(s->i8); tv_free(s->g8); tv_free(s->acc);
+}
+
+static inline size_t vt_index(const scratch *s, int h, int t, int d) {
+    return (((size_t)h * s->nchunks + t / TV_KCH) * TV_HEAD_DIM + d) * TV_KCH + t % TV_KCH;
 }
 
 // Debug views of q/k/v in the golden layout [head][t][dim].
@@ -393,56 +393,75 @@ static void dbg_qkv(ctx *c, const char *prefix, const scratch *s) {
     for (int h = 0; h < TV_HEADS; h++)
         for (int t = 0; t < T; t++)
             for (int d = 0; d < TV_HEAD_DIM; d++)
-                tmp[((size_t)h * T + t) * TV_HEAD_DIM + d] = s->vt[((size_t)h * TV_HEAD_DIM + d) * s->tpad + t];
+                tmp[((size_t)h * T + t) * TV_HEAD_DIM + d] = s->vt[vt_index(s, h, t, d)];
     snprintf(name, sizeof name, "%s.v", prefix); dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
     tv_free(tmp);
 }
 
-// Attention for queries [q0, q0+qn) and heads [h0, h1), writing y rows (q - t0). Keys are scored in
-// chunks so a chunk stays in cache across the query sub-tile; weights . V runs one V row at a time.
+// Attention for queries [q0, q0+qn) and heads [h0, h1), writing y rows (q - t0). Two passes over
+// key chunks, so no score matrix is stored: pass 1 finds each query's max dot product, pass 2
+// recomputes the dots, turns them into int8 weights and accumulates weights . values per chunk.
+// Integer sums, so the result equals the one-pass computation exactly.
 typedef struct {
     const tv_block *b;
     scratch *s;
     int q0, qn, t0, h0, h1, set;
+    uint64_t t_qk, t_soft, t_pv;    // time per phase on this job's core
 } attn_job;
 
 static void attn_run(void *arg) {
     attn_job *j = arg;
     scratch *s = j->s;
     const tv_block *b = j->b;
-    const int T = s->T, tpad = s->tpad;
-    int32_t *S = s->S[j->set];
-    int8_t *W = s->W[j->set];
-    int32_t sum[TV_QT], out[TV_QT];
+    const int T = s->T;
+    int32_t *acc = s->vacc[j->set];
+    int32_t mx[TV_TILE], sum[TV_TILE], sc[TV_KCH], o48[TV_HEAD_DIM];
+    int8_t w[TV_KCH] __attribute__((aligned(16)));
+    const uint8_t *lut = b->softmax_lut;
+    const uint32_t lim = (uint32_t)b->softmax_n;
     for (int h = j->h0; h < j->h1; h++) {
-        const int8_t *kh = s->kh + (size_t)h * T * TV_HEAD_DIM, *vt = s->vt + (size_t)h * TV_HEAD_DIM * tpad;
-        for (int k0 = 0; k0 < T; k0 += TV_KCH) {
-            int kn = T - k0 < TV_KCH ? T - k0 : TV_KCH;
-            for (int r = 0; r < j->qn; r++)
-                tv_dot_rows_i8(s->q8 + (size_t)(j->q0 + r) * TV_C + h * TV_HEAD_DIM, kh + (size_t)k0 * TV_HEAD_DIM, kn,
-                               TV_HEAD_DIM, S + (size_t)r * T + k0);
-        }
-        // Row-max scaled int8 weights (largest = 127), normalized by their own sum.
-        const uint8_t *lut = b->softmax_lut;
-        const uint32_t lim = (uint32_t)b->softmax_n;
-        for (int r = 0; r < j->qn; r++) {
-            const int32_t *sr = S + (size_t)r * T;
-            int8_t *wr = W + (size_t)r * tpad;
-            int32_t mx = INT32_MIN, total = 0;
-            for (int t = 0; t < T; t++) if (sr[t] > mx) mx = sr[t];
-            for (int t = 0; t < T; t++) {
-                uint32_t gap = (uint32_t)(mx - sr[t]);
-                int32_t w = gap < lim ? lut[gap] : 0;
-                wr[t] = (int8_t)w;
-                total += w;
+        const int8_t *kh = s->kh + (size_t)h * T * TV_HEAD_DIM;
+        const int8_t *vt = s->vt + (size_t)h * s->nchunks * TV_HEAD_DIM * TV_KCH;
+        uint64_t t0 = tv_time_us();
+        for (int r = 0; r < j->qn; r++) mx[r] = INT32_MIN;
+        for (int c = 0; c < s->nchunks; c++) {
+            int k0 = c * TV_KCH, kn = T - k0 < TV_KCH ? T - k0 : TV_KCH;
+            for (int r = 0; r < j->qn; r++) {
+                tv_dot_rows_i8(s->q8 + (size_t)(j->q0 + r) * TV_C + h * TV_HEAD_DIM, kh + (size_t)k0 * TV_HEAD_DIM, kn, TV_HEAD_DIM, sc);
+                int32_t m = mx[r];
+                for (int t = 0; t < kn; t++) if (sc[t] > m) m = sc[t];
+                mx[r] = m;
             }
-            sum[r] = total;
         }
-        for (int d = 0; d < TV_HEAD_DIM; d++) {
-            tv_dot_rows_i8(vt + (size_t)d * tpad, W, j->qn, tpad, out);
-            for (int r = 0; r < j->qn; r++)
-                s->y[(size_t)(j->q0 - j->t0 + r) * TV_C + h * TV_HEAD_DIM + d] = (float)out[r] * (b->s_v / (float)sum[r]);
+        uint64_t t1 = tv_time_us();
+        memset(acc, 0, (size_t)j->qn * TV_HEAD_DIM * sizeof(int32_t));
+        memset(sum, 0, sizeof sum);
+        for (int c = 0; c < s->nchunks; c++) {
+            int k0 = c * TV_KCH, kn = T - k0 < TV_KCH ? T - k0 : TV_KCH;
+            const int8_t *vc = vt + (size_t)c * TV_HEAD_DIM * TV_KCH;
+            if (kn < TV_KCH) memset(w + kn, 0, TV_KCH - kn);
+            for (int r = 0; r < j->qn; r++) {
+                tv_dot_rows_i8(s->q8 + (size_t)(j->q0 + r) * TV_C + h * TV_HEAD_DIM, kh + (size_t)k0 * TV_HEAD_DIM, kn, TV_HEAD_DIM, sc);
+                // Row-max scaled int8 weights (largest = 127), normalized by their own sum.
+                int32_t m = mx[r], total = 0;
+                for (int t = 0; t < kn; t++) {
+                    uint32_t gap = (uint32_t)(m - sc[t]);
+                    int32_t v = gap < lim ? lut[gap] : 0;
+                    w[t] = (int8_t)v;
+                    total += v;
+                }
+                sum[r] += total;
+                tv_dot_rows_i8(w, vc, TV_HEAD_DIM, TV_KCH, o48);
+                int32_t *ar = acc + (size_t)r * TV_HEAD_DIM;
+                for (int d = 0; d < TV_HEAD_DIM; d++) ar[d] += o48[d];
+            }
         }
+        for (int r = 0; r < j->qn; r++) {
+            const int32_t *ar = acc + (size_t)r * TV_HEAD_DIM;
+            for (int d = 0; d < TV_HEAD_DIM; d++)
+                s->y[(size_t)(j->q0 - j->t0 + r) * TV_C + h * TV_HEAD_DIM + d] = (float)ar[d] * (b->s_v / (float)sum[r]);
+        }
+        j->t_qk += t1 - t0; j->t_pv += tv_time_us() - t1;
     }
 }
 
@@ -479,7 +498,7 @@ static void block_forward(ctx *c, const tv_block *b, const char *prefix, float *
             quantize(row + 2 * TV_C, TV_C, b->s_v, vq);
             for (int h = 0; h < TV_HEADS; h++) {
                 memcpy(s->kh + ((size_t)h * T + t) * TV_HEAD_DIM, kq + h * TV_HEAD_DIM, TV_HEAD_DIM);
-                for (int d = 0; d < TV_HEAD_DIM; d++) s->vt[((size_t)h * TV_HEAD_DIM + d) * s->tpad + t] = vq[h * TV_HEAD_DIM + d];
+                for (int d = 0; d < TV_HEAD_DIM; d++) s->vt[vt_index(s, h, t, d)] = vq[h * TV_HEAD_DIM + d];
             }
         }
     }
@@ -487,13 +506,10 @@ static void block_forward(ctx *c, const tv_block *b, const char *prefix, float *
     // ---- pass 2: attention per query tile (heads split over the cores), output projection, residual
     for (int t0 = 0; t0 < T; t0 += TV_TILE) {
         int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
-        uint64_t t_att = tv_time_us();
-        for (int q0 = t0; q0 < t0 + rows; q0 += TV_QT) {
-            int qn = t0 + rows - q0 < TV_QT ? t0 + rows - q0 : TV_QT;
-            attn_job ja = {b, s, q0, qn, t0, 0, TV_HEADS / 2, 0}, jb = {b, s, q0, qn, t0, TV_HEADS / 2, TV_HEADS, 1};
-            tv_parallel2(attn_run, &ja, &jb);
-        }
-        tv_prof[TV_P_ATTN_DOT] += tv_time_us() - t_att;
+        attn_job ja = {b, s, t0, rows, t0, 0, TV_HEADS / 2, 0, 0, 0, 0}, jb = {b, s, t0, rows, t0, TV_HEADS / 2, TV_HEADS, 1, 0, 0, 0};
+        tv_parallel2(attn_run, &ja, &jb);
+        tv_prof[TV_P_ATTN_DOT] += ja.t_qk + jb.t_qk;     // pass 1
+        tv_prof[TV_P_ATTN_PV] += ja.t_pv + jb.t_pv;      // pass 2: dots again, weights, weights . values
         quantize(s->y, rows * TV_C, b->s_attn, s->i8);
         snprintf(name, sizeof name, "%s.attn", prefix); dbg_tile(c, &s->d_attn, name, TV_I8, s->i8, t0, rows, TV_C, T);
         linear_add(c, &b->out, s->i8, rows, x + (size_t)t0 * TV_C);

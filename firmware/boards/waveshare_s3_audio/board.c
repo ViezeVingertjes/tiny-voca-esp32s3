@@ -1,19 +1,54 @@
 // Waveshare ESP32-S3-AUDIO-Board: ES8311 DAC over I2S, NS4150B amplifier enabled through pin 8 of
-// the TCA9555 I/O expander. Pins from the Waveshare wiki:
-//   I2C SDA 11, SCL 10; I2S MCLK 12, BCLK 13, WS 14, DOUT 16.
+// the TCA9555 I/O expander, and a ring of 7 WS2812B LEDs used as a sound level meter.
+// Pins (Waveshare wiki, community pin map): I2C SDA 11, SCL 10; I2S MCLK 12, BCLK 13, WS 14,
+// DOUT 16; LEDs 38.
 // Only expander port 1 bit 0 (PA enable) is ever written: port 0 holds the USB/camera mux, and
 // driving pins 6/7 the wrong way kills USB.
 #include "board.h"
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include "driver/i2c_master.h"
 #include "es8311.h"
 #include "i2s_player.h"
+#include "ws2812.h"
 
 #define TCA9555_ADDR 0x20
 #define ES8311_ADDR 0x18
 
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t codec, expander;
+static ws2812 *leds;
+
+// ---------------------------------------------------------------- LED level meter
+#define LED_PIN 38
+#define LED_COUNT 7
+#define LED_BRIGHTNESS 40.0f        // of 255: the LEDs are very bright
+#define METER_FLOOR_DB (-45.0f)     // no LED lit below this
+#define METER_TOP_DB (-9.0f)        // all LEDs lit above this
+#define METER_FALL 0.3f             // LEDs per 10 ms update while the level drops
+
+// Called every 10 ms by the player with the RMS (0..1) of what is being heard.
+static void meter(float rms) {
+    static float shown;
+    static uint8_t last[LED_COUNT][3];
+    float db = rms > 1e-6f ? 20.0f * log10f(rms) : -120.0f;
+    float target = (db - METER_FLOOR_DB) / (METER_TOP_DB - METER_FLOOR_DB) * LED_COUNT;
+    target = target < 0 ? 0 : target > LED_COUNT ? LED_COUNT : target;
+    shown = target > shown ? target : (shown - METER_FALL > target ? shown - METER_FALL : target);
+    uint8_t now[LED_COUNT][3];
+    for (int i = 0; i < LED_COUNT; i++) {
+        float on = shown - i;
+        on = on < 0 ? 0 : on > 1 ? 1 : on;
+        on = on * on * LED_BRIGHTNESS;                      // rough gamma for the partly lit LED
+        float r = i < 4 ? 0.0f : 1.0f, g = i < 4 ? 1.0f : i < 6 ? 0.7f : 0.0f;   // green, yellow, red
+        now[i][0] = (uint8_t)(r * on); now[i][1] = (uint8_t)(g * on); now[i][2] = 0;
+    }
+    if (!memcmp(now, last, sizeof now)) return;            // nothing changed: leave the LEDs alone
+    memcpy(last, now, sizeof now);
+    for (int i = 0; i < LED_COUNT; i++) ws2812_set(leds, i, now[i][0], now[i][1], now[i][2]);
+    ws2812_show(leds);
+}
 
 const char *board_name(void) { return "waveshare_s3_audio"; }
 
@@ -44,6 +79,13 @@ int board_init(int volume) {
     i2c_master_bus_add_device(bus, &dc, &expander);
     i2s_player_pins pins = {.mclk = 12, .bclk = 13, .ws = 14, .dout = 16, .sample_rate = 24000};
     if (i2s_player_start(&pins)) return -2;                 // MCLK must run before the codec is set up
+    leds = ws2812_new(LED_PIN, LED_COUNT);
+    if (leds) {
+        ws2812_show(leds);                                  // all off
+        i2s_player_set_meter(meter);
+    } else {
+        printf("leds: RMT setup failed, no level meter\n");
+    }
     int rc = es8311_start(codec, volume);
     if (rc) { printf("audio: ES8311 init failed (%d)\n", rc); codec = NULL; return -3; }
     if (amp_enable()) { printf("audio: TCA9555 not answering, amplifier left off\n"); return -4; }

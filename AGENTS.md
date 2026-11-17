@@ -30,7 +30,7 @@ relative to the tiny-voca root (`ROOT = Path(__file__).parents[2]`).
 | `engine/host/` | `tvhost`: runs the engine on the host and compares every tensor with the golden dump |
 | `firmware/main/` | ESP-IDF app: S3 kernels (`kernels_s3.S`, `tv_kernels_s3.c`), console (`main.c`), phonemizer glue, `board.h` |
 | `firmware/boards/<name>/` | One folder per board: `board.c`, `sdkconfig.defaults` (flash, PSRAM), `partitions.csv` |
-| `firmware/drivers/` | Hardware code shared by boards: ES8311 codec, I2S player |
+| `firmware/drivers/` | Hardware code shared by boards: ES8311 codec, I2S player (with a level tap), WS2812 LEDs |
 | `bench/` | Microbenchmarks of the S3 (SIMD kernels, memory bandwidth, libm) |
 | `third_party/dizione` | C++17 port of the dizione phonemizer, from audio.cpp PR #1311, with small patches (`PROVENANCE.md`) |
 | `monitor.sh` | Serial monitor that forwards stdin to the board |
@@ -139,6 +139,9 @@ I2C SDA 11, SCL 10; I2S MCLK 12, BCLK 13, WS 14, DOUT 16 (DIN 15 for the mics, u
 (register values from Espressif's es8311 driver). The NS4150B amplifier is enabled by pin 8 of the
 TCA9555 expander (0x20): only port 1 bit 0 is ever written, with read-modify-write. **Never drive
 expander port 0**: pins 6/7 are the USB/camera mux and the wrong level kills USB.
+The ring of 7 WS2812B LEDs on GPIO 38 is a sound level meter (`meter()` in `board.c`): the I2S
+player reports the RMS of each 10 ms piece as it is heard (levels delayed by the 4-piece DMA depth),
+mapped from -45 to -9 dB onto the LEDs, green, yellow, red, instant rise and a ~0.35 s fall.
 
 Flash: app 2 MB at 0x10000, `model` 6 MB at 0x210000, `testvec` 1 MB at 0x810000, `phonemizer` 6 MB
 at 0x910000 (`boards/waveshare_s3_audio/partitions.csv`). The model is memory-mapped from flash;

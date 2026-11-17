@@ -4,9 +4,15 @@ Type a sentence, hear it. [tiny-voca](https://github.com/n4ze3m/tiny-voca), a 4.
 text-to-speech model, running entirely on an ESP32-S3: phonemizer, neural network and speaker.
 No cloud, no computer once it is flashed.
 
+## Supported boards
+
+| Board | `BOARD` | Status |
+|---|---|---|
+| [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) | `waveshare_s3_audio` | Works |
+
 ## What you need
 
-- A [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) (16 MB flash, 8 MB PSRAM, speaker)
+- A supported board (16 MB flash, 8 MB PSRAM, a speaker)
 - [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) v6.1
 - To export the model once: a [tiny-voca](https://github.com/n4ze3m/tiny-voca) checkout with this repo
   at `esp32/`, Python with PyTorch, and the weights from [Hugging Face](https://huggingface.co/n4ze3m/tiny-voca)
@@ -27,7 +33,7 @@ python esp32/tools/pack_phonemizer.py ../models/tiny-voca/phonemizer esp32/out/p
 ```bash
 cd esp32/firmware
 . $IDF_PATH/export.sh
-idf.py build flash
+idf.py -B build/waveshare_s3_audio -DBOARD=waveshare_s3_audio build flash
 esptool write-flash 0x210000 ../out/tvoca.bin 0x810000 ../out/test0_dev.bin 0x910000 ../out/phonemizer.bin
 ```
 

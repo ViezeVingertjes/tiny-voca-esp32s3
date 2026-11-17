@@ -14,7 +14,7 @@
 #include "freertos/task.h"
 #include "tv.h"
 #include "tv_kernels.h"
-#include "audio.h"
+#include "board.h"
 #include "phonemize.h"
 #include "sentences.h"
 
@@ -175,7 +175,7 @@ typedef struct {
 
 static void stream_flush(stream_state *st) {
     if (!st->fill) return;
-    audio_play(st->chunk, st->fill);                 // the player frees it
+    board_play(st->chunk, st->fill);                 // the player frees it
     st->chunk = NULL;
     st->fill = 0;
 }
@@ -234,6 +234,7 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
     int n = tvp_phonemize(text, ids, stress, 512);
     if (n == -2 || n > 0) {
         stream_state st = {0};
+        board_show_text(text);
         tv_profile_reset();
         tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st};
         tv_result r;
@@ -309,7 +310,8 @@ static void run(void *arg) {
     t = esp_timer_get_time();
     if (!pdata || tvp_init(pdata, psize)) printf("phonemizer not available: %s\n", pdata ? tvp_error() : "no partition");
     else printf("phonemizer ready in %.1f ms\n", (esp_timer_get_time() - t) / 1000.0);
-    if (audio_init(50) == 0) audio_beep(880, 120);
+    printf("board: %s\n", board_name());
+    if (board_init(50) == 0) board_beep(880, 120);
     printf("free PSRAM %u (largest block %u), internal %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     have_test = tdata && !tv_file_open(&test, tdata, tsize);
@@ -321,13 +323,13 @@ static void run(void *arg) {
         read_line(line, sizeof line);
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
         else if (!strcmp(line, "TEST")) run_test();
-        else if (!strcmp(line, "beep")) audio_beep(880, 300);
+        else if (!strcmp(line, "beep")) board_beep(880, 300);
         else if (!strcmp(line, "mmbench")) mmbench();
         else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
         else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
         else if (!strncmp(line, "vol ", 4)) {
             int v = atoi(line + 4);
-            printf(audio_set_volume(v) ? "volume: codec not available\n" : "volume %d%%\n", v < 0 ? 0 : v > 100 ? 100 : v);
+            printf(board_set_volume(v) ? "volume: codec not available\n" : "volume %d%%\n", v < 0 ? 0 : v > 100 ? 100 : v);
         }
         else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only
             static int32_t ids[512], st[512];

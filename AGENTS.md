@@ -28,7 +28,9 @@ relative to the tiny-voca root (`ROOT = Path(__file__).parents[2]`).
 | `engine/` | Portable C engine (`tv.c` model, `tv_dsp.c` vocoder, `tv_kernels.h` backend interface) |
 | `engine/tv_kernels_ref.c` | Host backend: plain C, **emulates the S3 QACC exactly** (20-bit saturation) |
 | `engine/host/` | `tvhost`: runs the engine on the host and compares every tensor with the golden dump |
-| `firmware/` | ESP-IDF app: S3 kernels (`kernels_s3.S`, `tv_kernels_s3.c`), console (`main.c`), audio, phonemizer glue |
+| `firmware/main/` | ESP-IDF app: S3 kernels (`kernels_s3.S`, `tv_kernels_s3.c`), console (`main.c`), phonemizer glue, `board.h` |
+| `firmware/boards/<name>/` | One folder per board: `board.c`, `sdkconfig.defaults` (flash, PSRAM), `partitions.csv` |
+| `firmware/drivers/` | Hardware code shared by boards: ES8311 codec, I2S player |
 | `bench/` | Microbenchmarks of the S3 (SIMD kernels, memory bandwidth, libm) |
 | `third_party/dizione` | C++17 port of the dizione phonemizer, from audio.cpp PR #1311, with small patches (`PROVENANCE.md`) |
 | `monitor.sh` | Serial monitor that forwards stdin to the board |
@@ -111,7 +113,26 @@ memory, and the unknown-word GRU is faster (weight rows read once per word, the 
 both cores, dot lanes in registers, memoized words), with identical results. Dictionary words cost
 about 0.2 ms each, unknown words about 0.3 s. Setup takes 3.5 s at boot.
 
-## Board (Waveshare ESP32-S3-AUDIO-Board)
+## Boards
+
+The app talks to the hardware only through `firmware/main/board.h`: `board_init`, `board_play`
+(24 kHz mono, takes ownership), `board_set_volume`, `board_beep`, and `board_show_text` (the text being
+spoken; boards without a screen ignore it). The board is chosen at build time:
+
+```bash
+idf.py -B build/<board> -DBOARD=<board> build flash     # configuration kept in sdkconfig.<board>
+```
+
+`firmware/sdkconfig.defaults` holds the settings every board shares; `boards/<board>/sdkconfig.defaults`
+adds flash size and mode, PSRAM mode and the partition table path.
+
+To add a board: copy `boards/waveshare_s3_audio`, change the pins and the amplifier/power glue in
+`board.c`, set flash and PSRAM in its `sdkconfig.defaults`, and size `partitions.csv` to the flash.
+Shared hardware code goes to `drivers/`. Current needs: about 11.4 MB of flash (app 1.2 MB, model
+4.85 MB, phonemizer data 5.4 MB, test vector 0.3 MB) and 8 MB of PSRAM (phonemizer ~2.9 MB,
+synthesis ~0.7 MB + 2.7 KB per frame; octal PSRAM, quad is slower).
+
+### Waveshare ESP32-S3-AUDIO-Board (`waveshare_s3_audio`)
 
 I2C SDA 11, SCL 10; I2S MCLK 12, BCLK 13, WS 14, DOUT 16 (DIN 15 for the mics, unused). ES8311 at
 0x18 (chip id 0x83 0x11 at 0xFD/0xFE), set up as an I2S slave with MCLK = 256 x 24 kHz, 16-bit
@@ -119,8 +140,19 @@ I2C SDA 11, SCL 10; I2S MCLK 12, BCLK 13, WS 14, DOUT 16 (DIN 15 for the mics, u
 TCA9555 expander (0x20): only port 1 bit 0 is ever written, with read-modify-write. **Never drive
 expander port 0**: pins 6/7 are the USB/camera mux and the wrong level kills USB.
 
-Flash: app 2 MB at 0x10000, `model` 6 MB at 0x210000, `testvec` 1 MB at 0x810000, `phonemizer` 6 MB at
-0x910000. The model is memory-mapped from flash; PSRAM holds the phonemizer (~2.9 MB) and activations.
+Flash: app 2 MB at 0x10000, `model` 6 MB at 0x210000, `testvec` 1 MB at 0x810000, `phonemizer` 6 MB
+at 0x910000 (`boards/waveshare_s3_audio/partitions.csv`). The model is memory-mapped from flash;
+PSRAM holds the phonemizer (~2.9 MB) and activations.
+
+### Waveshare ESP32-S3-ePaper-1.54 (not supported yet)
+
+Checked 2026-11-17 against [the Waveshare docs](https://docs.waveshare.com/ESP32-S3-ePaper-1.54) and
+[demo code](https://github.com/waveshareteam/ESP32-S3-ePaper-1.54). Same ES8311 codec, a 200 x 200
+e-paper screen for `board_show_text`. Two versions, and their example code is not interchangeable:
+V1 is an ESP32-S3FH4R2 (4 MB flash, 2 MB quad PSRAM): the int8 model alone (4.85 MB) is larger
+than the flash, so it would need int4 weights (~2.4 MB) and the Mac doing the phonemizing.
+V2 ("V2" printed top-left on the PCB, since Nov 2025) is an ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB
+PSRAM): it needs the phonemizer data compacted (the 3.3 MB lexicon text, float G2P weights) to fit.
 
 ## Validation workflow
 

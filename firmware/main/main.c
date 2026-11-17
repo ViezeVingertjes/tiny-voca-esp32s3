@@ -155,6 +155,7 @@ typedef struct {
     int16_t *chunk;
     int fill;
     float peak;
+    int64_t t_first;            // when the first samples arrived
 } stream_state;
 
 #define STREAM_CHUNK 4800
@@ -168,6 +169,7 @@ static void stream_flush(stream_state *st) {
 
 static void on_audio(void *user, const float *x, int n) {
     stream_state *st = user;
+    if (!st->t_first) st->t_first = esp_timer_get_time();
     for (int i = 0; i < n; i++) {
         if (!st->chunk) st->chunk = tv_alloc(STREAM_CHUNK * 2);
         float v = x[i];
@@ -194,8 +196,8 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
         if (rc == 0) {
             stream_flush(&st);
             double ms = (esp_timer_get_time() - t0) / 1000.0, audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
-            printf("  [%d phonemes, %d frames, %.2f s audio in %.2f s, RTF %.2f, peak %.2f] %s\n", n, r.n_frames,
-                   audio_ms / 1000, ms / 1000, audio_ms / ms, st.peak, text);
+            printf("  [%d phonemes, %d frames, %.2f s audio, first sound after %.2f s, done after %.2f s, peak %.2f] %s\n",
+                   n, r.n_frames, audio_ms / 1000, (st.t_first - t0) / 1e6, ms / 1000, st.peak, text);
             tv_free(r.durations);
             if (profiling) tv_profile_report();
             return 0;

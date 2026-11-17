@@ -1,6 +1,7 @@
 // Source-filter vocoder of tiny-voca (model.py SourceFilter), batch size 1.
 // Matches torch.stft/istft with center=True, constant padding, periodic Hann window.
 #include "tv.h"
+#include "tv_kernels.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,7 +204,8 @@ static float gaussian(uint64_t *state) {     // xorshift64* + Box-Muller (the en
 // followed by fft/2 zeros, frame m multiplied by its response, torch.istft, first S samples.
 // Frames are processed in order; padded positions [m*hop, (m+1)*hop) are final after frame m,
 // so memory is a few windows long. The arithmetic order equals the batch computation.
-#define FIFO_SIZE 2048
+#define VOC_BLOCK 8192               // samples per parallel step of the two branches
+#define FIFO_SIZE (VOC_BLOCK + 1024)
 typedef struct {
     int fft, hop, bins, frames, S, P;
     int m;                      // next frame
@@ -214,6 +216,7 @@ typedef struct {
     float seg[SYNTH_FFT], buf[SYNTH_FFT], tr[SYNTH_FFT], ti[SYNTH_FFT];
     float fifo[FIFO_SIZE];
     int count;                  // samples waiting in fifo
+    int produced;               // samples ever appended to fifo
 } branch;
 
 typedef struct {
@@ -296,6 +299,7 @@ static void branch_step(branch *b, sources *src) {
         if (out < 0 || out >= b->S) continue;
         float e = b->env[i];
         b->fifo[b->count++] = e > 1e-11f ? b->ola[i] / e : b->ola[i];
+        b->produced++;
     }
     memmove(b->ola, b->ola + hop, (fft_n - hop) * sizeof(float));
     memmove(b->env, b->env + hop, (fft_n - hop) * sizeof(float));
@@ -305,29 +309,39 @@ static void branch_step(branch *b, sources *src) {
     tv_prof[TV_P_VOC_SHAPE] += tv_time_us() - t0;
 }
 
+typedef struct {
+    branch *b;
+    sources *src;
+    int target;                 // run until this many samples were produced
+} branch_job;
+
+static void branch_run(void *arg) {
+    branch_job *j = arg;
+    while (j->b->produced < j->target && j->b->m < j->b->frames) branch_step(j->b, j->src);
+}
+
 void tv_vocoder_stream(const float *h, const float *n, const float *f0, const float *noise, uint64_t seed, int T,
                        tv_audio_fn sink, void *user) {
     const int S = T * TV_HOP;
     branch *hb = malloc(sizeof(branch)), *nb = malloc(sizeof(branch));
+    float *out = malloc(VOC_BLOCK * sizeof(float));
     sources src = {h, n, T, {f0, T, 0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
     branch_init(hb, SYNTH_FFT, SYNTH_HOP, 1, S);
     branch_init(nb, NOISE_FFT, NOISE_HOP, 0, S);
-    float out[FIFO_SIZE];
     int emitted = 0;
     while (emitted < S) {
-        // advance whichever branch is behind, then emit what both have
-        if (hb->count <= nb->count && hb->m < hb->frames) branch_step(hb, &src);
-        else if (nb->m < nb->frames) branch_step(nb, &src);
-        else branch_step(hb, &src);
-        int k = hb->count < nb->count ? hb->count : nb->count;
-        if (k <= 0) continue;
+        // Both branches advance on their own core until they cover the next block.
+        int target = emitted + VOC_BLOCK < S ? emitted + VOC_BLOCK : S;
+        branch_job jh = {hb, &src, target}, jn = {nb, &src, target};
+        tv_parallel2(branch_run, &jh, &jn);
+        int k = target - emitted;
         for (int i = 0; i < k; i++) out[i] = hb->fifo[i] + nb->fifo[i];
         memmove(hb->fifo, hb->fifo + k, (hb->count - k) * sizeof(float)); hb->count -= k;
         memmove(nb->fifo, nb->fifo + k, (nb->count - k) * sizeof(float)); nb->count -= k;
         sink(user, out, k);
         emitted += k;
     }
-    free(hb); free(nb);
+    free(hb); free(nb); free(out);
 }
 
 typedef struct { float *dst; int n; } collect_state;

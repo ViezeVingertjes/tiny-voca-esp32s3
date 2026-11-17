@@ -4,6 +4,10 @@
 #pragma once
 #include "tv.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // 16-byte aligned, with at least 64 bytes of readable slack after n (kernels over-read).
 void *tv_alloc(size_t n);
 void tv_free(void *p);
@@ -48,3 +52,7 @@ void tv_parallel2(void (*fn)(void *), void *a, void *b);
 
 // Exact int32 dot products: out[n] = sum_k x[k] * W[n*K + k]. K % 16 == 0.
 void tv_dot_rows_i8(const int8_t *x, const int8_t *W, int N, int K, int32_t *out);
+
+#ifdef __cplusplus
+}
+#endif

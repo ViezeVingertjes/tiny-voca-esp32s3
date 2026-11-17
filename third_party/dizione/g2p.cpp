@@ -4,23 +4,32 @@
 
 namespace dizione {
 
+void (*g2p_parallel)(void (*fn)(void *), void *a, void *b) = nullptr;
+
 namespace {
 
 // A dot product summed in eight lanes, so that the order of the additions is
 // fixed whatever the compiler does with the loop.
+// tiny-voca esp32: the eight lanes as named locals so they stay in registers (GCC for Xtensa kept
+// the array on the stack). Same order of operations as the original array form.
 float dot(const float * a, const float * b, size_t size) {
-    float lane[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float l0 = 0, l1 = 0, l2 = 0, l3 = 0, l4 = 0, l5 = 0, l6 = 0, l7 = 0;
     size_t i = 0;
     for (; i + 8 <= size; i += 8) {
-        for (size_t k = 0; k < 8; ++k) {
-            lane[k] += a[i + k] * b[i + k];
-        }
+        l0 += a[i] * b[i];
+        l1 += a[i + 1] * b[i + 1];
+        l2 += a[i + 2] * b[i + 2];
+        l3 += a[i + 3] * b[i + 3];
+        l4 += a[i + 4] * b[i + 4];
+        l5 += a[i + 5] * b[i + 5];
+        l6 += a[i + 6] * b[i + 6];
+        l7 += a[i + 7] * b[i + 7];
     }
     float rest = 0;
     for (; i < size; ++i) {
         rest += a[i] * b[i];
     }
-    return ((lane[0] + lane[1]) + (lane[2] + lane[3])) + ((lane[4] + lane[5]) + (lane[6] + lane[7])) + rest;
+    return ((l0 + l1) + (l2 + l3)) + ((l4 + l5) + (l6 + l7)) + rest;
 }
 
 float sigmoid(float x) {
@@ -32,8 +41,9 @@ float sigmoid(float x) {
 void gru(const std::vector<float> & x, size_t frames, size_t width, const Tensor & w_ih, const Tensor & w_hh, const Tensor & b_ih,
          const Tensor & b_hh, bool reverse, size_t hidden, float * out, size_t stride) {
     std::vector<float> inputs(frames * 3 * hidden);
-    for (size_t t = 0; t < frames; ++t) {
-        for (size_t g = 0; g < 3 * hidden; ++g) {
+    // tiny-voca esp32: weight row outer, frames inner, so each row is read once (same results)
+    for (size_t g = 0; g < 3 * hidden; ++g) {
+        for (size_t t = 0; t < frames; ++t) {
             inputs[t * 3 * hidden + g] = dot(&x[t * width], &w_ih.values[g * width], width) + b_ih.values[g];
         }
     }
@@ -57,6 +67,21 @@ void gru(const std::vector<float> & x, size_t frames, size_t width, const Tensor
             out[t * stride + h] = state[h];
         }
     }
+}
+
+struct GruJob {
+    const std::vector<float> * x;
+    size_t frames, width;
+    const Tensor *w_ih, *w_hh, *b_ih, *b_hh;
+    bool reverse;
+    size_t hidden;
+    float * out;
+    size_t stride;
+};
+
+void run_gru(void * arg) {
+    const GruJob & j = *static_cast<const GruJob *>(arg);
+    gru(*j.x, j.frames, j.width, *j.w_ih, *j.w_hh, *j.b_ih, *j.b_hh, j.reverse, j.hidden, j.out, j.stride);
 }
 
 }  // namespace
@@ -131,6 +156,19 @@ std::vector<std::string> G2p::predict(StrView word_in) const {
     if (word.empty()) {
         return {};
     }
+    const auto known = cache_.find(word);
+    if (known != cache_.end()) {
+        return known->second;
+    }
+    std::vector<std::string> result = predict_spellable(word);
+    if (cache_.size() >= 512) {
+        cache_.clear();
+    }
+    cache_.emplace(word, result);
+    return result;
+}
+
+std::vector<std::string> G2p::predict_spellable(const Str & word) const {
     const auto hidden = static_cast<size_t>(hidden_);
     const auto slots = static_cast<size_t>(slots_);
     const Tensor & embed = weights_.at("embed__weight");
@@ -148,11 +186,19 @@ std::vector<std::string> G2p::predict(StrView word_in) const {
     }
     for (long layer = 0; layer < layers_; ++layer) {
         std::vector<float> both(frames * 2 * hidden);
+        GruJob jobs[2];
         for (int direction = 0; direction < 2; ++direction) {
             const std::string name = "l" + std::to_string(layer) + (direction == 1 ? "_reverse" : "");
-            gru(x, frames, width, weights_.at("gru__weight_ih_" + name), weights_.at("gru__weight_hh_" + name),
-                weights_.at("gru__bias_ih_" + name), weights_.at("gru__bias_hh_" + name), direction == 1, hidden,
-                both.data() + (direction == 1 ? hidden : 0), 2 * hidden);
+            jobs[direction] = {&x, frames, width, &weights_.at("gru__weight_ih_" + name), &weights_.at("gru__weight_hh_" + name),
+                               &weights_.at("gru__bias_ih_" + name), &weights_.at("gru__bias_hh_" + name), direction == 1, hidden,
+                               both.data() + (direction == 1 ? hidden : 0), 2 * hidden};
+        }
+        // tiny-voca esp32: the two directions are independent (and write disjoint halves)
+        if (g2p_parallel) {
+            g2p_parallel(run_gru, &jobs[0], &jobs[1]);
+        } else {
+            run_gru(&jobs[0]);
+            run_gru(&jobs[1]);
         }
         x = std::move(both);
         width = 2 * hidden;

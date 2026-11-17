@@ -2,6 +2,7 @@
 #include "phonemize.h"
 #include "dizione.h"
 #include "tv.h"
+#include "tv_kernels.h"
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -27,6 +28,7 @@ extern "C" int tvp_init(const void *container, size_t size) {
         data.homographs = std::string(blob(f, "homographs.json"));
         data.g2p_weights = dizione::parse_npz(std::string(blob(f, "g2p.npz")));
         if (data.lexicon_view.empty() || data.align.empty()) { snprintf(g_error, sizeof g_error, "phonemizer data incomplete"); return -1; }
+        dizione::g2p_parallel = tv_parallel2;                       // GRU directions on both cores
         g_phonemizer = std::make_unique<dizione::Phonemizer>(std::move(data));
     } catch (const std::exception &e) {
         snprintf(g_error, sizeof g_error, "%s", e.what());

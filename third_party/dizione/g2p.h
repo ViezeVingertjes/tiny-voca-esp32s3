@@ -15,6 +15,10 @@
 
 namespace dizione {
 
+// tiny-voca esp32: optional hook that runs fn(a) and fn(b), possibly on two cores at once
+// (the two GRU directions are independent). Null: run one after the other.
+extern void (*g2p_parallel)(void (*fn)(void *), void *a, void *b);
+
 struct Tensor {
     std::vector<size_t> shape;
     std::vector<float> values;          // row-major
@@ -34,6 +38,7 @@ public:
 
 private:
     const Tensor & tensor(const std::string & name, std::vector<size_t> shape) const;
+    std::vector<std::string> predict_spellable(const Str & word) const;
 
     std::unordered_map<char32_t, int> letters_;
     std::vector<std::string> symbols_;
@@ -41,6 +46,8 @@ private:
     long layers_ = 0;
     long hidden_ = 0;
     Tensors weights_;
+    // tiny-voca esp32: predictions already made (bounded), for unknown words that repeat
+    mutable std::unordered_map<Str, std::vector<std::string>> cache_;
 };
 
 }  // namespace dizione

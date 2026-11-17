@@ -309,7 +309,7 @@ static void run(void *arg) {
     t = esp_timer_get_time();
     if (!pdata || tvp_init(pdata, psize)) printf("phonemizer not available: %s\n", pdata ? tvp_error() : "no partition");
     else printf("phonemizer ready in %.1f ms\n", (esp_timer_get_time() - t) / 1000.0);
-    if (audio_init(30) == 0) audio_beep(880, 120);
+    if (audio_init(50) == 0) audio_beep(880, 120);
     printf("free PSRAM %u (largest block %u), internal %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     have_test = tdata && !tv_file_open(&test, tdata, tsize);
@@ -331,8 +331,9 @@ static void run(void *arg) {
         }
         else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only
             static int32_t ids[512], st[512];
+            int64_t tp = esp_timer_get_time();
             int n = tvp_phonemize(line + 5, ids, st, 512);
-            printf("PHON %d:", n);
+            printf("PHON %d in %.1f ms:", n, (esp_timer_get_time() - tp) / 1000.0);
             for (int i = 0; i < n; i++) printf(" %d", (int)ids[i]);
             printf("\n");
         }

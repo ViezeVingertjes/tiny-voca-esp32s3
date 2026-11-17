@@ -13,3 +13,8 @@ Used by `esp32/tools/dizione_cli.cpp` to phonemize text on the host for the ESP3
 ESP32-S3 can read the 3.3 MB `lexicon.tsv` from memory-mapped flash instead of copying it into RAM.
 With `lexicon_view` empty the behaviour is the original one. `parse_npz` exposes the g2p.npz reader
 for data held in memory. Both are marked "tiny-voca esp32" in the code.
+
+Unknown-word model (`g2p.*`), for speed on the ESP32-S3, results unchanged: the input projection
+loops weight-row outer so each row is read once per word; the two GRU directions can run through
+a `g2p_parallel` hook (on both cores); predictions are memoized (up to 512 words); `dot` keeps its
+eight lanes in named locals (registers) instead of an array.

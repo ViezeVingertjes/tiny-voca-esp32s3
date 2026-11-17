@@ -128,6 +128,8 @@ Tensors npz(const std::string & bytes) {
 
 }  // namespace
 
+Tensors parse_npz(const std::string & bytes) { return npz(bytes); }
+
 Data load_directory(const std::string & directory) {
     Data data;
     if (!read_file(directory + "/lexicon.tsv", data.lexicon)) {

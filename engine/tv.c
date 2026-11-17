@@ -128,7 +128,8 @@ static void load_block(loader *L, tv_block *b, const char *prefix) {
     double score_scale = (double)b->s_q * b->s_k / sqrt((double)TV_HEAD_DIM);
     b->softmax_n = (int)ceil(log(254.0) / score_scale) + 1;      // 127 * exp(-gap * s) < 0.5 beyond
     b->softmax_lut = malloc(b->softmax_n);
-    for (int g = 0; g < b->softmax_n; g++) b->softmax_lut[g] = (uint8_t)lrint(127.0 * exp(-g * score_scale));
+    double v = 127.0, step = exp(-score_scale);             // 127 * exp(-g * s) by repeated multiplication
+    for (int g = 0; g < b->softmax_n; g++, v *= step) b->softmax_lut[g] = (uint8_t)lrint(v);
     // project reads codes q standing for (q + 128) * s_gelu + GELU_MIN: fold the constant part.
     tv_linear *p = &b->project;
     for (int n = 0; n < p->N; n++) {
@@ -538,6 +539,11 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
     int T = 0;
     for (int t = 0; t < N; t++) T += dur[t];
     if (T < 1) { tv_free(x); tv_free(hidden); tv_free(dur); return -2; }
+    if (opt->max_frames > 0 && T > opt->max_frames) {
+        res->n_frames = T;
+        tv_free(x); tv_free(hidden); tv_free(dur);
+        return TV_TOO_LONG;
+    }
     // ---- repeat token states by duration, add position-in-token and voice
     float *frames = xmalloc((size_t)T * TV_C * sizeof(float)), *ph = xmalloc((size_t)T * TV_C * sizeof(float));
     uint8_t *vowel = xmalloc(T);

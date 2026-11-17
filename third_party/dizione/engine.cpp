@@ -41,11 +41,23 @@ std::vector<Str> texts(const std::vector<normalize::Token> & words, size_t index
 
 }  // namespace
 
+Lexicon Lexicon::external(std::string_view text) {
+    Lexicon lexicon;
+    lexicon.view_ = text;
+    lexicon.index();
+    return lexicon;
+}
+
 Lexicon::Lexicon(std::string text) : text_(std::move(text)) {
-    if (text_.size() > 0xFFFFFFFFULL) {
+    view_ = text_;
+    index();
+}
+
+void Lexicon::index() {
+    if (view_.size() > 0xFFFFFFFFULL) {
         throw ValueError("the dictionary (lexicon.tsv) is too large");
     }
-    const std::string_view all(text_);
+    const std::string_view all(view_);
     size_t start = 0;
     while (start < all.size()) {
         size_t end = all.find('\n', start);
@@ -72,7 +84,7 @@ Lexicon::Lexicon(std::string text) : text_(std::move(text)) {
 }
 
 std::string_view Lexicon::word_at(uint32_t line) const {
-    const std::string_view rest = std::string_view(text_).substr(line);
+    const std::string_view rest = view_.substr(line);
     return rest.substr(0, rest.find('\t'));
 }
 
@@ -82,7 +94,7 @@ std::optional<std::string_view> Lexicon::find(std::string_view word) const {
     if (found == lines_.end() || word_at(*found) != word) {
         return std::nullopt;
     }
-    std::string_view value = std::string_view(text_).substr(*found + word.size() + 1);
+    std::string_view value = view_.substr(*found + word.size() + 1);
     value = value.substr(0, value.find('\n'));
     if (!value.empty() && value.back() == '\r') {
         value.remove_suffix(1);
@@ -90,7 +102,8 @@ std::optional<std::string_view> Lexicon::find(std::string_view word) const {
     return value;
 }
 
-Phonemizer::Phonemizer(Data data, bool join_phrases) : lexicon_(std::move(data.lexicon)) {
+Phonemizer::Phonemizer(Data data, bool join_phrases)
+    : lexicon_(data.lexicon_view.empty() ? Lexicon(std::move(data.lexicon)) : Lexicon::external(data.lexicon_view)) {
     if (lexicon_.empty()) {
         throw ValueError("no phonemizer data: the dictionary (lexicon.tsv) is missing");
     }

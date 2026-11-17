@@ -37,6 +37,7 @@ constexpr int kVersion = 4;
 // The built data files, as their contents.
 struct Data {
     std::string lexicon;            // lexicon.tsv
+    std::string_view lexicon_view;  // tiny-voca esp32: lexicon.tsv kept outside (e.g. mapped flash); used when non-empty
     std::string align;              // align.json
     std::string g2p;                // g2p.json; empty for no unknown-word model
     Tensors g2p_weights;            // the arrays of g2p.npz
@@ -46,6 +47,8 @@ struct Data {
 // Reads lexicon.tsv, align.json, g2p.json, g2p.npz and homographs.json from a
 // directory. Raises ValueError when the dictionary is missing.
 Data load_directory(const std::string & directory);
+// tiny-voca esp32: the arrays of a g2p.npz held in memory.
+Tensors parse_npz(const std::string & bytes);
 
 // The dictionary: the lines of lexicon.tsv ("word<TAB>pronunciation"), found
 // by binary search. The index is four bytes a word, where a hash map of the
@@ -54,6 +57,18 @@ class Lexicon {
 public:
     Lexicon() = default;
     explicit Lexicon(std::string text);
+    // tiny-voca esp32: refer to text that outlives the lexicon instead of copying it.
+    static Lexicon external(std::string_view text);
+    Lexicon(Lexicon && other) noexcept { *this = std::move(other); }
+    Lexicon & operator=(Lexicon && other) noexcept {
+        const bool owned = other.view_.data() == other.text_.data();
+        text_ = std::move(other.text_);
+        lines_ = std::move(other.lines_);
+        view_ = owned ? std::string_view(text_) : other.view_;
+        return *this;
+    }
+    Lexicon(const Lexicon &) = delete;
+    Lexicon & operator=(const Lexicon &) = delete;
 
     bool empty() const { return lines_.empty(); }
     bool contains(std::string_view word) const { return find(word).has_value(); }
@@ -62,8 +77,10 @@ public:
 
 private:
     std::string_view word_at(uint32_t line) const;
+    void index();
 
     std::string text_;
+    std::string_view view_;             // what lookups read: text_, or external text
     std::vector<uint32_t> lines_;       // where each line starts, ordered by its word
 };
 

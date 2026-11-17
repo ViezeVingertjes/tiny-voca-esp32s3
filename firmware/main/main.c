@@ -2,6 +2,7 @@
 // model from the `model` partition, report timings, and stream prosody + audio back over
 // the console as base64 ("TVDUMP" blocks, decoded by esp32/tools/serial_dump.py).
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
@@ -12,6 +13,9 @@
 #include "freertos/task.h"
 #include "tv.h"
 #include "tv_kernels.h"
+#include "audio.h"
+#include "phonemize.h"
+#include "sentences.h"
 
 static const void *map_partition(const char *label, size_t *size) {
     const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label);
@@ -134,22 +138,117 @@ static void run_syn(char *line) {
     printf("DONE\n");
 }
 
+// Frames that fit in the free PSRAM (peak use is in the vocoder, ~19 KB per frame).
+static int frame_budget(void) {
+    long free_bytes = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 256 * 1024;
+    return free_bytes > 0 ? (int)(free_bytes / 19500) : 0;
+}
+
+// One piece of text: phonemize, synthesize, queue for playback. Splits at clauses when too long.
+static int say_piece(char *text, int voice, unsigned seed, int depth) {
+    static int32_t ids[512], stress[512];
+    int n = tvp_phonemize(text, ids, stress, 512);
+    if (n == -2 || n > 0) {
+        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget()};
+        tv_result r;
+        int64_t t0 = esp_timer_get_time();
+        int rc = n > 0 ? tv_synthesize(&model, ids, stress, n, voice, &opt, &r) : TV_TOO_LONG;
+        if (rc == 0) {
+            double ms = (esp_timer_get_time() - t0) / 1000.0, audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
+            float peak = 0;
+            for (int i = 0; i < r.n_samples; i++) if (fabsf(r.audio[i]) > peak) peak = fabsf(r.audio[i]);
+            float gain = 32767.0f * (peak > 0.99f ? 0.99f / peak : 1.0f);
+            int16_t *pcm = tv_alloc((size_t)r.n_samples * 2);
+            for (int i = 0; i < r.n_samples; i++) pcm[i] = (int16_t)lrintf(r.audio[i] * gain);
+            printf("  [%d phonemes, %.2f s audio in %.2f s, RTF %.2f] %s\n", n, audio_ms / 1000, ms / 1000, audio_ms / ms, text);
+            tv_free(r.audio); tv_free(r.durations);
+            audio_play(pcm, r.n_samples);
+            return 0;
+        }
+        if (rc != TV_TOO_LONG) { printf("  synthesis failed (%d): %s\n", rc, text); return -1; }
+        if (depth == 0) {
+            char *parts[32];
+            int k = tv_split_clauses(text, parts, 32);
+            if (k > 1) {
+                for (int i = 0; i < k; i++) say_piece(parts[i], voice, seed + 101 * i, 1);
+                return 0;
+            }
+        }
+        printf("  too long for memory (%d frames, budget %d): %s\n", r.n_frames, opt.max_frames, text);
+        return -1;
+    }
+    printf("  cannot phonemize: %s (%s)\n", tvp_error(), text);
+    return -1;
+}
+
+static int voice_id = 1;      // M2
+
+static void say(char *line) {
+    static char buf[2048];
+    snprintf(buf, sizeof buf - 2, "%s", line);
+    tv_finish_text(buf);
+    char *parts[64];
+    int k = tv_split_sentences(buf, parts, 64);
+    for (int i = 0; i < k; i++) say_piece(parts[i], voice_id, (unsigned)i, 0);
+}
+
+// Line input with echo and backspace (works in idf.py monitor and from scripts).
+static int read_line(char *buf, int size) {
+    int n = 0;
+    for (;;) {
+        int c = fgetc(stdin);
+        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (c == '\r' || c == '\n') {
+            if (n == 0) continue;           // second half of CRLF, or an empty line
+            putchar('\n'); fflush(stdout);
+            buf[n] = 0;
+            return n;
+        }
+        if (c == 0x7f || c == 0x08) {
+            if (n) { n--; fputs("\b \b", stdout); fflush(stdout); }
+            continue;
+        }
+        if (n < size - 1 && (c >= 0x20 || c >= 0x80)) {
+            buf[n++] = (char)c;
+            putchar(c); fflush(stdout);
+        }
+    }
+}
+
 static void run(void *arg) {
-    size_t msize, tsize;
+    size_t msize, tsize, psize;
     const void *mdata = map_partition("model", &msize), *tdata = map_partition("testvec", &tsize);
+    const void *pdata = map_partition("phonemizer", &psize);
     if (!mdata) goto done;
     int64_t t = esp_timer_get_time();
     if (tv_model_init(&model, mdata, msize)) { printf("model init failed: %s\n", model.error); goto done; }
-    printf("model ready in %.1f ms; free PSRAM %u, internal %u\n", (esp_timer_get_time() - t) / 1000.0,
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    printf("model ready in %.1f ms\n", (esp_timer_get_time() - t) / 1000.0);
+    t = esp_timer_get_time();
+    if (!pdata || tvp_init(pdata, psize)) printf("phonemizer not available: %s\n", pdata ? tvp_error() : "no partition");
+    else printf("phonemizer ready in %.1f ms\n", (esp_timer_get_time() - t) / 1000.0);
+    if (audio_init(70) == 0) audio_beep(880, 120);
+    printf("free PSRAM %u (largest block %u), internal %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     have_test = tdata && !tv_file_open(&test, tdata, tsize);
+    printf("\nType a phrase and press Enter. Commands: voice F2|M2, vol N, beep, TEST\n");
     static char line[8192];
     for (;;) {
-        printf("READY\n");
+        printf("READY\ntts> ");
         fflush(stdout);
-        if (!fgets(line, sizeof line, stdin)) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        read_line(line, sizeof line);
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
-        else if (!strncmp(line, "TEST", 4)) run_test();
+        else if (!strcmp(line, "TEST")) run_test();
+        else if (!strcmp(line, "beep")) audio_beep(880, 300);
+        else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
+        else if (!strncmp(line, "vol ", 4)) printf("volume: re-run audio init not supported yet\n");
+        else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only
+            static int32_t ids[512], st[512];
+            int n = tvp_phonemize(line + 5, ids, st, 512);
+            printf("PHON %d:", n);
+            for (int i = 0; i < n; i++) printf(" %d", (int)ids[i]);
+            printf("\n");
+        }
+        else say(line);
         fflush(stdout);
     }
 done:
@@ -165,5 +264,5 @@ void app_main(void) {
     usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
     setvbuf(stdin, NULL, _IONBF, 0);
     printf("\n#### tiny-voca firmware ####\n");
-    xTaskCreatePinnedToCore(run, "tv_run", 32768, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(run, "tv_run", 49152, NULL, 5, NULL, 0);
 }

@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define TV_C 192            // channels
 #define TV_HEADS 4
 #define TV_HEAD_DIM 48
@@ -87,6 +91,7 @@ typedef struct {
     const float *noise;             // NULL: engine's own Gaussian noise; else n_frames*TV_HOP values
     uint32_t seed;
     const int32_t *force_durations; // NULL: predicted
+    int max_frames;                 // > 0: return TV_TOO_LONG instead of synthesizing more frames
     tv_debug_fn debug;
     void *debug_user;
 } tv_options;
@@ -98,6 +103,7 @@ typedef struct {
     long qacc_saturations;          // must be 0
 } tv_result;
 
+#define TV_TOO_LONG (-3)            // predicted frames exceed tv_options.max_frames; split the text
 int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, int n_tokens, int voice,
                   const tv_options *opt, tv_result *out);
 
@@ -116,3 +122,7 @@ void tv_profile_report(void);       // printf, one line per category
 // ---------------------------------------------------------------- internals shared with the DSP file
 void tv_vocoder(const float *harmonic /*[T][98]*/, const float *noise_params /*[T][36]*/, const float *f0 /*[T]*/,
                 const float *noise /*[T*hop]*/, int T, float *audio /*[T*hop]*/);
+
+#ifdef __cplusplus
+}
+#endif

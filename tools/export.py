@@ -1,6 +1,6 @@
 """Export tiny-voca for the ESP32-S3 engine, plus a test vector from the golden model.
 
-    python esp32/tools/export.py            # writes esp32/out/tvoca.bin and esp32/out/test0.bin
+    python tools/export.py            # writes out/tvoca.bin and out/test0.bin
 
 Container format (little-endian), shared by both files:
     header   "TVQ1", u32 version (1), u32 count, u32 reserved
@@ -78,9 +78,9 @@ def project_preload(wq, mean_code, chunks):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default=str(qe.ROOT.parent / "models/tiny-voca/tiny-voca.pt"))
-    parser.add_argument("--lexicon", default=str(qe.ROOT.parent / "models/tiny-voca/phonemizer/lexicon.tsv"))
-    parser.add_argument("--output", default=str(qe.ROOT / "esp32/out"))
+    parser.add_argument("--checkpoint", default=str(qe.WEIGHTS / "tiny-voca.pt"))
+    parser.add_argument("--lexicon", default=str(qe.WEIGHTS / "phonemizer/lexicon.tsv"))
+    parser.add_argument("--output", default=str(qe.REPO / "out"))
     parser.add_argument("--test-sentence", type=int, default=0)
     parser.add_argument("--test-voice", type=int, default=1)
     args = parser.parse_args()

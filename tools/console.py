@@ -1,7 +1,7 @@
 """Send lines to the firmware console and print the replies (each line waits for the next READY).
 Hard deadline. With --boot, first prints the boot log up to the first READY.
 
-    python esp32/tools/console.py --boot "Hello there." "voice F2" "How are you?"
+    python tools/console.py --boot "Hello there." "voice F2" "How are you?"
 """
 import argparse, signal, sys, time
 import serial

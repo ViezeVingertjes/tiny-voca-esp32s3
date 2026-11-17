@@ -1,19 +1,23 @@
 """Text -> phonemes on the Mac -> synthesis on the ESP32-S3 -> WAV, with a keep-up report.
 
-    python esp32/tools/speak_s3.py --text "Hello there. How are you today?" --out esp32/out/s3.wav
+    python tools/speak_s3.py --text "Hello there. How are you today?" --out out/s3.wav
 
-The firmware (esp32/firmware) must be running its command server. Phonemes come from the C++
-dizione port (esp32/out/bin/dizione_cli, built from esp32/third_party/dizione); without that
+The firmware (firmware/) must be running its command server. Phonemes come from the C++
+dizione port (out/bin/dizione_cli, built from third_party/dizione); without that
 binary a plain lexicon lookup is used and words missing from the lexicon are skipped.
 Keep-up model: sentences are synthesized one after another and each plays as soon as it is
 ready and the previous one has finished; any wait between sentences is a gap.
 """
-import argparse, base64, signal, subprocess, sys, time, wave
+import argparse, base64, os, signal, subprocess, sys, time, wave
 from pathlib import Path
 import serial
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+REPO = Path(__file__).resolve().parents[1]                     # this repo; outputs go to REPO / "out"
+# The tiny-voca source (for the model code) and its weights; only needed to export or evaluate.
+TINY_VOCA = Path(os.environ.get("TINY_VOCA_DIR", REPO.parent)).resolve()
+WEIGHTS = Path(os.environ.get("TINY_VOCA_WEIGHTS",
+                              TINY_VOCA / "weights" if (TINY_VOCA / "weights").exists() else TINY_VOCA.parent / "models/tiny-voca"))
+sys.path.insert(0, str(TINY_VOCA / "src"))
 from tiny_voca.infer import sentences, finished                          # noqa: E402
 from tiny_voca.text import chunks, normalize_text, tokenize, parse_espeak  # noqa: E402
 
@@ -112,9 +116,9 @@ def main():
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", choices=("F2", "M2"), default="M2")
     parser.add_argument("--port", default="/dev/cu.usbmodem1201")
-    parser.add_argument("--out", default=str(ROOT / "esp32/out/s3.wav"))
-    parser.add_argument("--phonemizer", default=str(ROOT.parent / "models/tiny-voca/phonemizer"))
-    parser.add_argument("--dizione", default=str(ROOT / "esp32/out/bin/dizione_cli"))
+    parser.add_argument("--out", default=str(REPO / "out/s3.wav"))
+    parser.add_argument("--phonemizer", default=str(WEIGHTS / "phonemizer"))
+    parser.add_argument("--dizione", default=str(REPO / "out/bin/dizione_cli"))
     parser.add_argument("--timeout", type=int, default=600, help="hard limit for the whole run, seconds")
     parser.add_argument("--profile", action="store_true", help="print the board's per-op profile")
     args = parser.parse_args()

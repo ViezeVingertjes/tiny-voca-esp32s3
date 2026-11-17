@@ -9,9 +9,12 @@ PIE SIMD, 8 MB octal PSRAM, 16 MB quad flash), with int8 weights and activations
 whole text-to-speaker path on the board: sentence splitting, the dizione phonemizer, synthesis and
 the ES8311 speaker codec.
 
-The repo is used as the `esp32/` submodule of a tiny-voca checkout. The Python tools import the
-model code from the parent (`src/tiny_voca`) and expect the weights at `../models/tiny-voca`
-relative to the tiny-voca root (`ROOT = Path(__file__).parents[2]`).
+Users flash prebuilt files from [Hugging Face](https://huggingface.co/ngxson/tiny-voca-esp32s3)
+(`hf download ngxson/tiny-voca-esp32s3 --local-dir out`): the merged firmware per board, `tvoca.bin`,
+`phonemizer.bin` and the test vector. Only exporting or evaluating the model needs the tiny-voca
+source: the tools read `TINY_VOCA_DIR` (a tiny-voca checkout, default: this repo's parent folder) and
+`TINY_VOCA_WEIGHTS` (default: `$TINY_VOCA_DIR/weights`, else `$TINY_VOCA_DIR/../models/tiny-voca`),
+and write to this repo's `out/`.
 
 ## Layout
 
@@ -156,6 +159,30 @@ V1 is an ESP32-S3FH4R2 (4 MB flash, 2 MB quad PSRAM): the int8 model alone (4.85
 than the flash, so it would need int4 weights (~2.4 MB) and the Mac doing the phonemizing.
 V2 ("V2" printed top-left on the PCB, since Nov 2025) is an ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB
 PSRAM): it needs the phonemizer data compacted (the 3.3 MB lexicon text, float G2P weights) to fit.
+
+## Exporting the model
+
+```bash
+git clone https://github.com/n4ze3m/tiny-voca ../tiny-voca && pip install -e "../tiny-voca"
+hf download n4ze3m/tiny-voca --local-dir ../tiny-voca/weights
+export TINY_VOCA_DIR=../tiny-voca
+python tools/export.py              # calibrates scales; out/tvoca.bin, out/test0.bin, out/test0_dev.bin
+python tools/pack_phonemizer.py ../tiny-voca/weights/phonemizer out/phonemizer.bin
+```
+
+Calibration is deterministic, so the same checkpoint gives the same `tvoca.bin`.
+
+## Releasing prebuilt files
+
+```bash
+cd firmware && idf.py -B build/release -DBOARD=<board> build
+cd build/release && esptool --chip esp32s3 merge-bin -o ../../../out/hf/<board>/firmware.bin @flash_args
+```
+
+`out/hf/` also holds `tvoca.bin`, `phonemizer.bin`, `test0_dev.bin`, `licenses/` (tiny-voca,
+CMUdict and homograph data, whose contents are inside `phonemizer.bin`) and the model card
+`README.md`. Flash the exact files once before uploading (`hf upload ngxson/tiny-voca-esp32s3 out/hf .`),
+then run `TEST` and compare with the host.
 
 ## Validation workflow
 

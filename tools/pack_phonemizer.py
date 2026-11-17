@@ -1,7 +1,7 @@
 """Pack dizione's data files into one TVQ1 container (raw int8 blobs) for the `phonemizer`
 flash partition of the ESP32-S3 firmware.
 
-    python esp32/tools/pack_phonemizer.py ../models/tiny-voca/phonemizer esp32/out/phonemizer.bin
+    python tools/pack_phonemizer.py $TINY_VOCA_WEIGHTS/phonemizer out/phonemizer.bin
 """
 import struct, sys
 from pathlib import Path

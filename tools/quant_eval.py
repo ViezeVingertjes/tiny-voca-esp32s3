@@ -12,14 +12,18 @@ so every sentence must use dictionary words. All variants see identical tokens.
 Writes one WAV per variant with all sentences in both voices, and prints distances to fp32
 measured with the fp32 durations forced, so the waveforms line up frame by frame.
 
-    python esp32/tools/quant_eval.py --checkpoint ../models/tiny-voca/tiny-voca.pt --output esp32/out/quant
+    python tools/quant_eval.py --output out/quant
 """
-import argparse, copy, math, sys, wave
+import argparse, copy, math, os, sys, wave
 from pathlib import Path
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+REPO = Path(__file__).resolve().parents[1]                     # this repo; outputs go to REPO / "out"
+# The tiny-voca source (for the model code) and its weights; only needed to export or evaluate.
+TINY_VOCA = Path(os.environ.get("TINY_VOCA_DIR", REPO.parent)).resolve()
+WEIGHTS = Path(os.environ.get("TINY_VOCA_WEIGHTS",
+                              TINY_VOCA / "weights" if (TINY_VOCA / "weights").exists() else TINY_VOCA.parent / "models/tiny-voca"))
+sys.path.insert(0, str(TINY_VOCA / "src"))
 from tiny_voca.infer import load_model, limit_peak                      # noqa: E402
 from tiny_voca.model import Attention, rotate                            # noqa: E402
 from tiny_voca.text import chunks, normalize_text, tokenize, parse_espeak  # noqa: E402
@@ -182,9 +186,9 @@ def write_wav(path, audio, sample_rate=24000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default=str(ROOT.parent / "models/tiny-voca/tiny-voca.pt"))
-    parser.add_argument("--lexicon", default=str(ROOT.parent / "models/tiny-voca/phonemizer/lexicon.tsv"))
-    parser.add_argument("--output", default=str(ROOT / "esp32/out/quant"))
+    parser.add_argument("--checkpoint", default=str(WEIGHTS / "tiny-voca.pt"))
+    parser.add_argument("--lexicon", default=str(WEIGHTS / "phonemizer/lexicon.tsv"))
+    parser.add_argument("--output", default=str(REPO / "out/quant"))
     parser.add_argument("--variants", help="comma-separated subset to run (fp32 always runs)")
     args = parser.parse_args()
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)

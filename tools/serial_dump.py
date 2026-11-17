@@ -1,7 +1,7 @@
 """Read the firmware's console: print the log, decode TVDUMP base64 blocks into a TVQ1 file.
 Hard deadline; stops on TVDUMP_DONE, "tv: finished", a panic or a reboot.
 
-    python esp32/tools/serial_dump.py /dev/cu.usbmodem1201 180 esp32/out/dev_test0.bin
+    python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev_test0.bin
 """
 import base64, signal, struct, sys, time
 import serial

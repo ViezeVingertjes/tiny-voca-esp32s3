@@ -1,5 +1,5 @@
 // One sentence per stdin line -> "ids<TAB>stress" (comma-separated) per stdout line,
-// or "ERR <message>". Uses the C++ dizione port in esp32/third_party/dizione.
+// or "ERR <message>". Uses the C++ dizione port in third_party/dizione.
 //   dizione_cli /path/to/phonemizer < sentences.txt
 #include "dizione.h"
 #include <iostream>

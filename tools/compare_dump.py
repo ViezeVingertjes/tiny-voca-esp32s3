@@ -1,5 +1,5 @@
 """Audio-level distance between two TVQ1 dumps holding `audio` and `prosody` (e.g. C engine vs golden).
-    python esp32/tools/compare_dump.py esp32/out/test0.bin esp32/out/c_test0.bin"""
+    python tools/compare_dump.py out/test0.bin out/c_test0.bin"""
 import struct, sys
 from pathlib import Path
 import numpy as np

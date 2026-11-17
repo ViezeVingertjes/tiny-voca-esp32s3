@@ -20,7 +20,13 @@ if [ -z "$PORT" ]; then
     exit 1
 fi
 
-PY="$(ls -d "$HOME"/.espressif/python_env/idf*_env/bin/python 2>/dev/null | tail -n1)"
+# ESP-IDF's Python if installed, else python3 (needs pyserial: pip install pyserial)
+PY="${PY:-$(ls -d "$HOME"/.espressif/python_env/idf*_env/bin/python 2>/dev/null | tail -n1)}"
+PY="${PY:-python3}"
+if ! "$PY" -c "import serial" 2>/dev/null; then
+    echo "$PY has no pyserial: pip install pyserial" >&2
+    exit 1
+fi
 # A killed idf.py monitor can leave the terminal raw (no Ctrl+C): reset it
 if [ -t 0 ]; then
     stty sane

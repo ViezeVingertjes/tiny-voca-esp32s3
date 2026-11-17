@@ -12,39 +12,17 @@ No cloud, no computer once it is flashed.
 |---|---|---|
 | [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) | `waveshare_s3_audio` | Works |
 
-## What you need
+## Quick start
 
-- A supported board (16 MB flash, 8 MB PSRAM, a speaker)
-- [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) v6.1
-- To export the model once: a [tiny-voca](https://github.com/n4ze3m/tiny-voca) checkout with this repo
-  at `esp32/`, Python with PyTorch, and the weights from [Hugging Face](https://huggingface.co/n4ze3m/tiny-voca)
-
-## Setup
-
-**Step 1: Export the model.** From the tiny-voca checkout:
+Just one thing: a supported board and a USB-C cable. The firmware and the model are prebuilt on
+[Hugging Face](https://huggingface.co/ngxson/tiny-voca-esp32s3).
 
 ```bash
-git submodule add git@github.com:ngxson/tiny-voca-esp32s3.git esp32
-hf download n4ze3m/tiny-voca --local-dir ../models/tiny-voca
-python esp32/tools/export.py
-python esp32/tools/pack_phonemizer.py ../models/tiny-voca/phonemizer esp32/out/phonemizer.bin
-```
-
-**Step 2: Flash.**
-
-```bash
-cd esp32/firmware
-. $IDF_PATH/export.sh
-idf.py -B build/waveshare_s3_audio -DBOARD=waveshare_s3_audio build flash
-esptool write-flash 0x210000 ../out/tvoca.bin 0x810000 ../out/test0_dev.bin 0x910000 ../out/phonemizer.bin
-```
-
-The second line (model and phonemizer data) is only needed again when those files change.
-
-**Step 3: Talk.**
-
-```bash
-../monitor.sh
+pip install esptool huggingface_hub pyserial
+git clone https://github.com/ngxson/tiny-voca-esp32s3 && cd tiny-voca-esp32s3
+hf download ngxson/tiny-voca-esp32s3 --local-dir out
+esptool write-flash 0x0 out/waveshare_s3_audio/firmware.bin 0x210000 out/tvoca.bin 0x910000 out/phonemizer.bin
+./monitor.sh
 ```
 
 ```
@@ -64,9 +42,20 @@ tts> Hello! This is tiny voca, speaking from the little board on your desk.
 A short sentence starts playing after about a second, a long one after a few seconds. One sentence
 can be up to about 15 seconds long; longer ones are split at commas.
 
-Technical details are in [AGENTS.md](AGENTS.md).
+## Building the firmware
+
+With [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) v6.1, after the Quick start (the model
+files in `out/` stay as they are):
+
+```bash
+cd firmware
+. $IDF_PATH/export.sh
+idf.py -B build/waveshare_s3_audio -DBOARD=waveshare_s3_audio build flash
+```
+
+Technical details, including how to export the model yourself, are in [AGENTS.md](AGENTS.md).
 
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE). `third_party/dizione` is from
-[audio.cpp](https://github.com/0xShug0/audio.cpp) (Apache-2.0). The model weights come with tiny-voca's license.
+[audio.cpp](https://github.com/0xShug0/audio.cpp) (Apache-2.0). The model comes from tiny-voca (Apache-2.0).

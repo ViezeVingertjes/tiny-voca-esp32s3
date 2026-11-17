@@ -97,7 +97,8 @@ void tv_linear_release(tv_linear *L) {
 typedef struct {
     const tv_linear *L;
     const int8_t *x;
-    float *y;
+    void *out;
+    const tv_epilogue *e;
     int T, nb0, nb1;
     long saturations;
 } mm_job;
@@ -127,8 +128,21 @@ static void mm_run(void *arg) {
                     total[i] = (c ? total[i] : 0) + v - (pre ? pre[i] : 0);
                 }
             }
-            float *yt = j->y + (size_t)t * N + nb * 16;
-            for (int i = 0; i < width; i++) yt[i] = (float)total[i] * scale[i] + bias[i];
+            const size_t at = (size_t)t * N + nb * 16;
+            const tv_epilogue *e = j->e;
+            if (e->mode == TV_EPI_STORE) {
+                float *yt = (float *)j->out + at;
+                for (int i = 0; i < width; i++) yt[i] = (float)total[i] * scale[i] + bias[i];
+            } else if (e->mode == TV_EPI_ADD) {
+                float *yt = (float *)j->out + at;
+                for (int i = 0; i < width; i++) yt[i] += (float)total[i] * scale[i] + bias[i];
+            } else {
+                int8_t *ot = (int8_t *)j->out + at;
+                for (int i = 0; i < width; i++) {
+                    int8_t q = tv_quant((float)total[i] * scale[i] + bias[i], e->inv);
+                    ot[i] = e->lut ? e->lut[q + 128] : q;
+                }
+            }
         }
     }
     j->saturations = sat;
@@ -162,15 +176,15 @@ void tv_kernels_init(void) {
     xTaskCreatePinnedToCore(worker, "tv_worker", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 1);
 }
 
-long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y) {
+long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {
     int nblocks = (L->N + 15) / 16;
     if (nblocks < 2) {
-        mm_job j = {L, x, y, T, 0, nblocks, 0};
+        mm_job j = {L, x, out, e, T, 0, nblocks, 0};
         mm_run(&j);
         return j.saturations;
     }
     int split = nblocks / 2;
-    mm_job a = {L, x, y, T, 0, split, 0}, b = {L, x, y, T, split, nblocks, 0};
+    mm_job a = {L, x, out, e, T, 0, split, 0}, b = {L, x, out, e, T, split, nblocks, 0};
     tv_parallel2(mm_run, &a, &b);
     return a.saturations + b.saturations;
 }

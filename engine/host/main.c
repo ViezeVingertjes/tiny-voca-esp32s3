@@ -127,12 +127,13 @@ int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s tvoca.bin test.bin out.wav [--force-durations] [--quiet]\n", argv[0]); return 2; }
     int force = 0, quiet = 0;
     const char *dump = NULL;
-    int vocoder_only = 0;
+    int vocoder_only = 0, twice = 0;
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "--force-durations")) force = 1;
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--vocoder-only")) vocoder_only = 1;
+        else if (!strcmp(argv[i], "--twice")) twice = 1;
     }
     size_t msize, tsize;
     void *mdata = read_file(argv[1], &msize), *tdata = read_file(argv[2], &tsize);
@@ -174,6 +175,16 @@ int main(int argc, char **argv) {
     printf("compared %d tensors: int8 %d tensors, %.4f%% of codes off; worst float max|diff|/max %.2e\n", c.compared,
            c.int8_tensors, c.int8_codes ? 100.0 * c.int8_off / c.int8_codes : 0.0, c.worst_float_rel);
     printf("QACC saturations: %ld\n", r.qacc_saturations);
+    if (twice) {    // the production path (no debug hook: fused epilogues) must give the same audio
+        tv_options o2 = opt;
+        o2.debug = NULL;
+        tv_result r2;
+        if (tv_synthesize(&model, ids, stress, n, *voice, &o2, &r2) == 0) {
+            int same = r2.n_samples == r.n_samples && !memcmp(r2.audio, r.audio, (size_t)r.n_samples * 4);
+            printf("production path (no debug hook): audio %s\n", same ? "bit-identical" : "DIFFERS");
+            free(r2.audio); free(r2.durations);
+        }
+    }
     tv_profile_report();
     if (dump && c.prosody && c.audio) {
         const char *names[] = {"prosody", "audio"};

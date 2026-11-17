@@ -13,12 +13,37 @@ void tv_kernels_init(void);
 int tv_linear_prepare(tv_linear *L);
 void tv_linear_release(tv_linear *L);
 
-// y[t][n] = acc[t][n] * (L->in_scale * L->ws[n]) + L->bias[n], acc = sum_k x[t][k] * w[n][k] with
-// QACC semantics (per-chunk preload, 20-bit lanes). x: [T][K] rows, K % 32 == 0.
-// Returns the number of saturated lanes seen (must be 0).
-long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y);
+// What happens to each output y = acc * (L->in_scale * L->ws[n]) + L->bias[n]:
+enum { TV_EPI_STORE,        // out (float*)[t][n] = y
+       TV_EPI_ADD,          // out (float*)[t][n] += y            (residual stream)
+       TV_EPI_Q8 };         // out (int8_t*)[t][n] = lut[q + 128] or q, q = round(y * inv) clamped to +-127
+typedef struct {
+    int mode;
+    float inv;
+    const int8_t *lut;
+} tv_epilogue;
 
-// Runs fn(a) and fn(b), on the two cores where there are two. fn must not call tv_linear_f32.
+// acc = sum_k x[t][k] * w[n][k] with QACC semantics (per-chunk preload, 20-bit lanes), then the
+// epilogue. x: [T][K] rows, K % 32 == 0. Returns the number of saturated lanes seen (must be 0).
+long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e);
+
+// The engine's float -> int8 rounding (half to even), shared by both backends.
+static inline int8_t tv_quant(float x, float inv) {
+    float q = x * inv;
+    q = q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q;
+    return (int8_t)((int32_t)(q + 12582912.0f) - 12582912);
+}
+
+static inline void tv_epilogue_put(const tv_epilogue *e, void *out, size_t at, float y) {
+    if (e->mode == TV_EPI_STORE) ((float *)out)[at] = y;
+    else if (e->mode == TV_EPI_ADD) ((float *)out)[at] += y;
+    else {
+        int8_t q = tv_quant(y, e->inv);
+        ((int8_t *)out)[at] = e->lut ? e->lut[q + 128] : q;
+    }
+}
+
+// Runs fn(a) and fn(b), on the two cores where there are two. fn must not call tv_linear_run.
 void tv_parallel2(void (*fn)(void *), void *a, void *b);
 
 // Exact int32 dot products: out[n] = sum_k x[k] * W[n*K + k]. K % 16 == 0.

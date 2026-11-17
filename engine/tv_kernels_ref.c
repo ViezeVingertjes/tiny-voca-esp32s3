@@ -26,7 +26,7 @@ void tv_kernels_init(void) {}
 int tv_linear_prepare(tv_linear *L) { (void)L; return 0; }
 void tv_linear_release(tv_linear *L) { (void)L; }
 
-long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y) {
+long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {
     long saturations = 0;
     int K = L->K, chunk = K / L->chunks;
     for (int t = 0; t < T; t++) {
@@ -43,7 +43,7 @@ long tv_linear_f32(const tv_linear *L, const int8_t *x, int T, float *y) {
                 }
                 total += run - pre;
             }
-            y[(size_t)t * L->N + n] = (float)total * (L->in_scale * L->ws[n]) + L->bias[n];
+            tv_epilogue_put(e, out, (size_t)t * L->N + n, (float)total * (L->in_scale * L->ws[n]) + L->bias[n]);
         }
     }
     return saturations;

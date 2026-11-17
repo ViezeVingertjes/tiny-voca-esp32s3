@@ -92,6 +92,18 @@ static void run_test(void) {
     tv_profile_report();
     printf("RESULT %d frames, %.0f ms of audio in %.0f ms (%.2fx real time), QACC saturations %ld\n", r.n_frames,
            audio_ms, ms, audio_ms / ms, r.qacc_saturations);
+    {   // the production path (no debug hook: fused epilogues) must give the same audio
+        tv_options o2 = opt;
+        o2.debug = NULL;
+        tv_result r2;
+        int64_t t1 = esp_timer_get_time();
+        if (tv_synthesize(&model, tv_file_get(&test, "ids", TV_I32, n), tv_file_get(&test, "stress", TV_I32, n), n,
+                          *(const int32_t *)tv_file_get(&test, "voice", TV_I32, 1), &o2, &r2) == 0) {
+            int same = r2.n_samples == r.n_samples && !memcmp(r2.audio, r.audio, (size_t)r.n_samples * 4);
+            printf("production path: %.0f ms, audio %s\n", (esp_timer_get_time() - t1) / 1000.0, same ? "bit-identical" : "DIFFERS");
+            tv_free(r2.audio); tv_free(r2.durations);
+        }
+    }
     if (st.prosody) dump_base64("prosody", st.prosody, (size_t)st.prosody_rows * 12, st.prosody_rows, 3);
     dump_base64("audio", r.audio, (size_t)r.n_samples * 4, 1, r.n_samples);
     tv_free(st.prosody);
@@ -181,6 +193,39 @@ static void on_audio(void *user, const float *x, int n) {
 }
 
 static int profiling = 0;
+
+// Matmul placement experiment on a real layer (acoustic block 0 expand: 640 x 192).
+static void mmbench(void) {
+    tv_linear L = model.block_storage[6].expand;
+    const int K = L.K, N = L.N, npad = (N + 15) / 16 * 16;
+    int8_t *w_ps = heap_caps_aligned_alloc(16, (size_t)npad * K + 64, MALLOC_CAP_SPIRAM);
+    memcpy(w_ps, L.wq, (size_t)npad * K);
+    for (int rows = 16; rows <= 64; rows *= 4) {
+        int8_t *x_ps = tv_alloc((size_t)rows * K), *x_in = heap_caps_aligned_alloc(16, (size_t)rows * K + 64, MALLOC_CAP_INTERNAL);
+        float *y_ps = tv_alloc((size_t)rows * N * 4), *y_in = rows <= 16 ? heap_caps_malloc((size_t)rows * N * 4, MALLOC_CAP_INTERNAL) : NULL;
+        for (int i = 0; i < rows * K; i++) x_ps[i] = x_in[i] = (int8_t)((i * 37) % 127 - 63);
+        struct { const char *name; const int8_t *w, *x; float *y; } cfg[] = {
+            {"W flash, x PSRAM, y PSRAM", L.wq, x_ps, y_ps}, {"W PSRAM, x PSRAM, y PSRAM", w_ps, x_ps, y_ps},
+            {"W flash, x SRAM,  y PSRAM", L.wq, x_in, y_ps}, {"W flash, x SRAM,  y SRAM", L.wq, x_in, y_in},
+            {"W PSRAM, x SRAM,  y SRAM", w_ps, x_in, y_in}};
+        for (int c = 0; c < 5; c++) {
+            if (!cfg[c].y) continue;
+            tv_linear l2 = L;
+            l2.wq = cfg[c].w;
+            int64_t best = INT64_MAX;
+            for (int rep = 0; rep < 3; rep++) {
+                int64_t t0 = esp_timer_get_time();
+                tv_epilogue e = {TV_EPI_STORE, 0, NULL};
+                tv_linear_run(&l2, cfg[c].x, rows, cfg[c].y, &e);
+                int64_t dt = esp_timer_get_time() - t0;
+                if (dt < best) best = dt;
+            }
+            printf("  rows %2d  %-28s %6lld us  %6.0f MMAC/s\n", rows, cfg[c].name, (long long)best, (double)rows * N * K / best);
+        }
+        tv_free(x_ps); heap_caps_free(x_in); tv_free(y_ps); if (y_in) heap_caps_free(y_in);
+    }
+    heap_caps_free(w_ps);
+}
 
 // One piece of text: phonemize, synthesize, queue for playback. Splits at clauses when too long.
 static int say_piece(char *text, int voice, unsigned seed, int depth) {
@@ -276,6 +321,7 @@ static void run(void *arg) {
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
         else if (!strcmp(line, "TEST")) run_test();
         else if (!strcmp(line, "beep")) audio_beep(880, 300);
+        else if (!strcmp(line, "mmbench")) mmbench();
         else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
         else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
         else if (!strncmp(line, "vol ", 4)) printf("volume: re-run audio init not supported yet\n");

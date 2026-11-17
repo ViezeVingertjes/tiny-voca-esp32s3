@@ -1,47 +1,64 @@
 # tiny-voca on the ESP32-S3
 
-A from-scratch inference engine for tiny-voca on the ESP32-S3 (240 MHz dual core, PIE SIMD,
-8 MB PSRAM), with int8 weights and activations (W8A8).
+Type a sentence, hear it. [tiny-voca](https://github.com/n4ze3m/tiny-voca), a 4.5M-parameter English
+text-to-speech model, running entirely on an ESP32-S3: phonemizer, neural network and speaker.
+No cloud, no computer once it is flashed.
 
-| Folder | What |
-|---|---|
-| `tools/tvq.py` | Golden model: the exact int8 numerics the engine implements (the spec) |
-| `tools/quant_eval.py` | Renders and measures quantization variants against fp32 |
-| `tools/export.py` | Writes `out/tvoca.bin` (weights in the kernel layout) and test vectors |
-| `engine/` | Portable C engine; `engine/host` builds it for the Mac and compares every tensor with the golden model |
-| `firmware/` | ESP-IDF firmware: PIE kernels, both cores, model in a flash partition |
-| `bench/` | Microbenchmarks of the S3 (SIMD kernels, memory, libm) |
-| `third_party/dizione` | C++ port of the dizione phonemizer (from audio.cpp, Apache-2.0) |
+## What you need
 
-## Build and flash (Waveshare ESP32-S3-AUDIO-Board)
+- A [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) (16 MB flash, 8 MB PSRAM, speaker)
+- [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) v6.1
+- To export the model once: a [tiny-voca](https://github.com/n4ze3m/tiny-voca) checkout with this repo
+  at `esp32/`, Python with PyTorch, and the weights from [Hugging Face](https://huggingface.co/n4ze3m/tiny-voca)
+
+## Setup
+
+**Step 1: Export the model.** From the tiny-voca checkout:
 
 ```bash
-python esp32/tools/export.py                                   # out/tvoca.bin, out/test0*.bin
+git submodule add git@github.com:ngxson/tiny-voca-esp32s3.git esp32
+hf download n4ze3m/tiny-voca --local-dir ../models/tiny-voca
+python esp32/tools/export.py
 python esp32/tools/pack_phonemizer.py ../models/tiny-voca/phonemizer esp32/out/phonemizer.bin
-cd esp32/firmware && . ~/work/esp-idf/export.sh
-idf.py build && idf.py -p /dev/cu.usbmodem1201 flash
-esptool --port /dev/cu.usbmodem1201 write-flash \
-    0x210000 ../out/tvoca.bin 0x810000 ../out/test0_dev.bin 0x910000 ../out/phonemizer.bin
-idf.py -p /dev/cu.usbmodem1201 monitor                         # then type a phrase at "tts>"
 ```
 
-The data partitions only need writing again when the model or phonemizer data change.
-
-Console commands: any text is spoken; `voice F2` / `voice M2`; `beep`; `prof` (per-op timings);
-`TEST` (golden test vector, prints a TVDUMP for `tools/serial_dump.py`); `PHON <text>` (ids only);
-`mmbench` (matmul speed with weights and activations in flash, PSRAM or SRAM).
-On the board everything runs locally: sentence splitting, dizione, synthesis and the speaker.
-A sentence that would not fit in PSRAM (about 1,400 frames, 15 s) is split at commas.
-
-## Validation
+**Step 2: Flash.**
 
 ```bash
-make -C esp32/engine/host
-esp32/engine/host/tvhost esp32/out/tvoca.bin esp32/out/test0.bin esp32/out/c.wav --dump esp32/out/c.bin
-python esp32/tools/serial_dump.py /dev/cu.usbmodem1201 180 esp32/out/dev.bin TEST
-python esp32/tools/compare_dump.py esp32/out/c.bin esp32/out/dev.bin       # board vs host
-python esp32/tools/compare_dump.py esp32/out/test0.bin esp32/out/dev.bin   # board vs golden model
-python esp32/tools/speak_s3.py --text "Hello there."   # Mac phonemizes, board synthesizes, WAV back
+cd esp32/firmware
+. $IDF_PATH/export.sh
+idf.py build flash
+esptool write-flash 0x210000 ../out/tvoca.bin 0x810000 ../out/test0_dev.bin 0x910000 ../out/phonemizer.bin
 ```
 
-ESP-IDF v6.1 (`. ~/work/esp-idf/export.sh`).
+The second line (model and phonemizer data) is only needed again when those files change.
+
+**Step 3: Talk.**
+
+```bash
+../monitor.sh
+```
+
+```
+tts> Hello! This is tiny voca, speaking from the little board on your desk.
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| any text | Speak it |
+| `voice F2` / `voice M2` | Female / male voice |
+| `vol 50` | Speaker volume, 0 to 100 |
+| `beep` | Test the speaker |
+| `prof` | Print where the time goes after each sentence |
+
+A short sentence starts playing after about a second, a long one after a few seconds. One sentence
+can be up to about 15 seconds long; longer ones are split at commas.
+
+Technical details are in [AGENTS.md](AGENTS.md).
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). `third_party/dizione` is from
+[audio.cpp](https://github.com/0xShug0/audio.cpp) (Apache-2.0). The model weights come with tiny-voca's license.

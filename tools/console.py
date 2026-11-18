@@ -17,7 +17,7 @@ signal.alarm(args.timeout)
 
 s = serial.Serial()
 s.port, s.baudrate, s.timeout = args.port, 115200, 0.2
-s.dtr = s.rts = False
+s.rts = False  # only RTS: DTR low with RTS high resets the S3
 for _ in range(50):
     try:
         s.open(); break

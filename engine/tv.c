@@ -335,9 +335,14 @@ static void dbg_tile(ctx *c, dbg_buf *d, const char *name, int dtype, const void
 
 typedef struct {
     int T, nchunks;                 // nchunks = ceil(T / TV_KCH)
-    int8_t *q8;                     // [T][192]
-    int8_t *kh;                     // [heads][T][48]
-    int8_t *vt;                     // [heads][nchunks][48][TV_KCH] values, transposed per key chunk
+    int lookahead;                  // > 0: queries see keys up to their own position + lookahead
+    int past;                       // > 0: and from their own position - past
+    // Queries, keys and values are kept for the last `ring` key chunks (nchunks: the whole
+    // utterance); position t is at t mod (ring * TV_KCH), so a chunk stays contiguous.
+    int ring;
+    int8_t *q8;                     // [ring * TV_KCH][192]
+    int8_t *kh;                     // [heads][ring * TV_KCH][48]
+    int8_t *vt;                     // [heads][ring][48][TV_KCH] values, transposed per key chunk
     int32_t *vacc[2];               // [TV_TILE][48] per core: weighted value sums of one head
     int32_t *cmax[2];               // [TV_TILE][nchunks] per core: max dot product per key chunk
     int8_t *w8[2];                  // [TV_TILE][TV_KCH] per core: attention weights of one key chunk
@@ -347,15 +352,22 @@ typedef struct {
     dbg_buf d_ln1, d_attn, d_dw, d_pre, d_gelu;
 } scratch;
 
-static void scratch_alloc(scratch *s, int T, int debug) {
+// Key/value storage per block: allocated separately when every block keeps its own.
+static size_t kv_rows(const scratch *s) { return (size_t)s->ring * TV_KCH; }
+static void kv_alloc(const scratch *s, int8_t **kh, int8_t **vt) {
+    size_t vsize = (size_t)TV_HEADS * kv_rows(s) * TV_HEAD_DIM;
+    *kh = xmalloc(vsize);
+    *vt = xmalloc(vsize + 64);                                          // tv_attn_pv48 reads past a chunk
+    memset(*vt, 0, vsize);                                              // keys past T stay 0
+}
+
+static void scratch_alloc(scratch *s, int T, int debug, int ring) {
     memset(s, 0, sizeof *s);
     s->T = T;
     s->nchunks = (T + TV_KCH - 1) / TV_KCH;
-    size_t vsize = (size_t)TV_HEADS * s->nchunks * TV_HEAD_DIM * TV_KCH;
-    s->q8 = xmalloc((size_t)T * TV_C);
-    s->kh = xmalloc((size_t)TV_HEADS * T * TV_HEAD_DIM);
-    s->vt = xmalloc(vsize + 64);                                        // tv_attn_pv48 reads past a chunk
-    memset(s->vt, 0, vsize);                                            // keys past T stay 0
+    s->ring = ring > 0 && ring < s->nchunks ? ring : s->nchunks;
+    s->q8 = xmalloc(kv_rows(s) * TV_C);
+    kv_alloc(s, &s->kh, &s->vt);
     for (int i = 0; i < 2; i++) s->vacc[i] = xmalloc((size_t)TV_TILE * TV_HEAD_DIM * sizeof(int32_t));
     for (int i = 0; i < 2; i++) s->cmax[i] = xmalloc((size_t)TV_TILE * s->nchunks * sizeof(int32_t));
     for (int i = 0; i < 2; i++) s->w8[i] = tv_alloc_fast((size_t)TV_TILE * TV_KCH);
@@ -376,8 +388,15 @@ static void scratch_free(scratch *s) {
     tv_free(s->i8); tv_free(s->g8);
 }
 
+static inline int8_t *q_row(const scratch *s, int t) { return s->q8 + (size_t)t % kv_rows(s) * TV_C; }
+static inline int8_t *k_row(const scratch *s, int h, int t) {
+    return s->kh + ((size_t)h * kv_rows(s) + (size_t)t % kv_rows(s)) * TV_HEAD_DIM;
+}
+static inline int8_t *v_chunk(const scratch *s, int h, int c) {
+    return s->vt + ((size_t)h * s->ring + (size_t)c % s->ring) * TV_HEAD_DIM * TV_KCH;
+}
 static inline size_t vt_index(const scratch *s, int h, int t, int d) {
-    return (((size_t)h * s->nchunks + t / TV_KCH) * TV_HEAD_DIM + d) * TV_KCH + t % TV_KCH;
+    return (size_t)(v_chunk(s, h, t / TV_KCH) - s->vt) + (size_t)d * TV_KCH + t % TV_KCH;
 }
 
 // Debug views of q/k/v in the golden layout [head][t][dim].
@@ -388,9 +407,11 @@ static void dbg_qkv(ctx *c, const char *prefix, const scratch *s) {
     int8_t *tmp = xmalloc((size_t)T * TV_C);
     for (int h = 0; h < TV_HEADS; h++)
         for (int t = 0; t < T; t++)
-            memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, s->q8 + (size_t)t * TV_C + h * TV_HEAD_DIM, TV_HEAD_DIM);
+            memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, q_row(s, t) + h * TV_HEAD_DIM, TV_HEAD_DIM);
     snprintf(name, sizeof name, "%s.q", prefix); dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
-    snprintf(name, sizeof name, "%s.k", prefix); dbg(c, name, TV_I8, s->kh, TV_HEADS * T, TV_HEAD_DIM);
+    for (int h = 0; h < TV_HEADS; h++)
+        for (int t = 0; t < T; t++) memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, k_row(s, h, t), TV_HEAD_DIM);
+    snprintf(name, sizeof name, "%s.k", prefix); dbg(c, name, TV_I8, tmp, TV_HEADS * T, TV_HEAD_DIM);
     for (int h = 0; h < TV_HEADS; h++)
         for (int t = 0; t < T; t++)
             for (int d = 0; d < TV_HEAD_DIM; d++)
@@ -410,6 +431,16 @@ typedef struct {
     uint64_t t_qk, t_soft, t_pv;    // time per phase on this job's core
 } attn_job;
 
+// Keys [k0 + *lo, k0 + hi) of the chunk [k0, k0 + kn) that query position q may see; returns hi.
+static inline int visible(const scratch *s, int q, int k0, int kn, int *lo) {
+    *lo = 0;
+    if (s->lookahead <= 0) return kn;
+    int hi = q + s->lookahead + 1 - k0;
+    hi = hi < 0 ? 0 : hi > kn ? kn : hi;
+    if (s->past > 0 && q - s->past > k0) *lo = q - s->past - k0 < hi ? q - s->past - k0 : hi;
+    return hi;
+}
+
 static void attn_run(void *arg) {
     attn_job *j = arg;
     scratch *s = j->s;
@@ -418,18 +449,19 @@ static void attn_run(void *arg) {
     int32_t *acc = s->vacc[j->set], *cmax = s->cmax[j->set];
     const int nch = s->nchunks;
     int32_t mx[TV_TILE], sum[TV_TILE];
+    uint8_t skip[TV_TILE];
     int8_t *w8 = s->w8[j->set];
     const uint8_t *lut = b->softmax_lut;
     const uint32_t lim = (uint32_t)b->softmax_n;
     for (int h = j->h0; h < j->h1; h++) {
-        const int8_t *kh = s->kh + (size_t)h * T * TV_HEAD_DIM;
-        const int8_t *vt = s->vt + (size_t)h * s->nchunks * TV_HEAD_DIM * TV_KCH;
         uint64_t t0 = tv_time_us();
         for (int r = 0; r < j->qn; r++) mx[r] = INT32_MIN;
         for (int c = 0; c < s->nchunks; c++) {
             int k0 = c * TV_KCH, kn = T - k0 < TV_KCH ? T - k0 : TV_KCH;
             for (int r = 0; r < j->qn; r++) {
-                int32_t cm = tv_attn_max48(s->q8 + (size_t)(j->q0 + r) * TV_C + h * TV_HEAD_DIM, kh + (size_t)k0 * TV_HEAD_DIM, kn, INT32_MIN);
+                int lo, hi = visible(s, j->q0 + r, k0, kn, &lo);
+                int32_t cm = hi > lo ? tv_attn_max48(q_row(s, j->q0 + r) + h * TV_HEAD_DIM, k_row(s, h, k0 + lo), hi - lo, INT32_MIN)
+                                     : INT32_MIN;
                 cmax[r * nch + c] = cm;
                 if (cm > mx[r]) mx[r] = cm;
             }
@@ -439,19 +471,21 @@ static void attn_run(void *arg) {
         memset(sum, 0, sizeof sum);
         for (int c = 0; c < s->nchunks; c++) {
             int k0 = c * TV_KCH, kn = T - k0 < TV_KCH ? T - k0 : TV_KCH;
-            const int8_t *vc = vt + (size_t)c * TV_HEAD_DIM * TV_KCH;
+            const int8_t *vc = v_chunk(s, h, c);
             // All weights of the chunk first, then all weights . values: each step streams one
             // chunk (keys, then values) instead of alternating between the two.
             for (int r = 0; r < j->qn; r++) {
-                if ((uint32_t)(mx[r] - cmax[r * nch + c]) >= lim) continue;   // every weight of the chunk is 0
+                int lo, hi = visible(s, j->q0 + r, k0, kn, &lo);
+                skip[r] = hi <= lo || (uint32_t)(mx[r] - cmax[r * nch + c]) >= lim;   // every weight of the chunk is 0
+                if (skip[r]) continue;
                 int8_t *w = w8 + (size_t)r * TV_KCH;
-                if (kn < TV_KCH) memset(w + kn, 0, TV_KCH - kn);
+                if (lo) memset(w, 0, lo);
+                if (hi < TV_KCH) memset(w + hi, 0, TV_KCH - hi);
                 // Row-max scaled int8 weights (largest = 127), normalized by their own sum.
-                sum[r] += tv_attn_weights48(s->q8 + (size_t)(j->q0 + r) * TV_C + h * TV_HEAD_DIM, kh + (size_t)k0 * TV_HEAD_DIM,
-                                            kn, mx[r], lut, lim, w);
+                sum[r] += tv_attn_weights48(q_row(s, j->q0 + r) + h * TV_HEAD_DIM, k_row(s, h, k0 + lo), hi - lo, mx[r], lut, lim, w + lo);
             }
             for (int r = 0; r < j->qn; r++)
-                if ((uint32_t)(mx[r] - cmax[r * nch + c]) < lim) tv_attn_pv48(w8 + (size_t)r * TV_KCH, vc, acc + (size_t)r * TV_HEAD_DIM);
+                if (!skip[r]) tv_attn_pv48(w8 + (size_t)r * TV_KCH, vc, acc + (size_t)r * TV_HEAD_DIM);
         }
         const float inv_attn = 1.0f / b->s_attn;
         for (int r = 0; r < j->qn; r++) {           // attention output, straight to the int8 codes of `out`
@@ -490,7 +524,7 @@ static void tile_rows(void *arg) {
         for (int r = j->r0; r < j->r1; r++) {
             const float *row = s->qkv + (size_t)r * 3 * TV_C, *cs = cos_t + r * half, *sn = sin_t + r * half;
             int t = t0 + r;
-            int8_t *q = s->q8 + (size_t)t * TV_C;
+            int8_t *q = q_row(s, t);
             for (int part = 0; part < 2; part++) {
                 const float *z = row + part * TV_C;
                 int8_t *o = part ? kq : q;
@@ -504,7 +538,7 @@ static void tile_rows(void *arg) {
             }
             for (int i = 0; i < TV_C; i++) vq[i] = tv_quant(row[2 * TV_C + i], iv);
             for (int h = 0; h < TV_HEADS; h++) {
-                memcpy(s->kh + ((size_t)h * T + t) * TV_HEAD_DIM, kq + h * TV_HEAD_DIM, TV_HEAD_DIM);
+                memcpy(k_row(s, h, t), kq + h * TV_HEAD_DIM, TV_HEAD_DIM);
                 for (int d = 0; d < TV_HEAD_DIM; d++) s->vt[vt_index(s, h, t, d)] = vq[h * TV_HEAD_DIM + d];
             }
         }
@@ -556,36 +590,57 @@ static void tile_parallel(int prof, int op, int rows, const tv_block *b, scratch
     tv_prof[prof] += tv_time_us() - start;
 }
 
-static void block_forward(ctx *c, const tv_block *b, const char *prefix, float *x, int T, scratch *s) {
+// How far one block got: rows [0, p1) have Q/K/V, [0, p2) attention, [0, p3) the depthwise conv and
+// FF (the block's output). carry is LayerNorm2 of rows p3-3 .. p3-1 from before their FF update.
+typedef struct {
+    int p1, p2, p3;
+    float carry[3 * TV_C];
+} block_pos;
+
+// Advances block b over the residual x so that rows [0, target) are final, given that its input
+// rows [0, avail) are final. Rows are independent of how they are grouped into tiles, so any
+// sequence of calls gives the same result as one call with target = avail = T.
+static void block_advance(ctx *c, const tv_block *b, const char *prefix, float *x, int T, scratch *s,
+                          block_pos *pos, int avail, int target) {
     char name[96];
-    // ---- pass 1: queries, keys and values of every position
-    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
-        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+    const int L = s->lookahead;
+    // ---- pass 1: queries, keys and values of the input rows that are final (with a look-ahead, only
+    // as far as the queries below need: in a ring, keys written early would replace ones still seen)
+    int n1 = L > 0 && target + 3 + L < avail ? target + 3 + L : avail, had = pos->p1;
+    while (pos->p1 < n1) {
+        int t0 = pos->p1, rows = n1 - t0 < TV_TILE ? n1 - t0 : TV_TILE;
         tile_parallel(TV_P_NORM, TILE_LN1, rows, b, s, x + (size_t)t0 * TV_C, t0, T);
         snprintf(name, sizeof name, "%s.ln1", prefix); dbg_tile(c, &s->d_ln1, name, TV_I8, s->i8, t0, rows, TV_C, T);
         linear_f(c, &b->qkv, s->i8, rows, s->qkv);
         tile_parallel(TV_P_ROPE, TILE_QKV, rows, b, s, NULL, t0, T);
+        pos->p1 += rows;
     }
-    dbg_qkv(c, prefix, s);
-    // ---- pass 2: attention per query tile (heads split over the cores), output projection, residual
-    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
-        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+    if (had < T && pos->p1 == T) dbg_qkv(c, prefix, s);
+    // ---- pass 2: attention for queries whose keys are all there (heads split over the cores)
+    int n2 = pos->p1 == T ? T : L > 0 && pos->p1 > L ? pos->p1 - L : 0;
+    if (n2 > target + 3) n2 = target + 3 < T ? target + 3 : T;        // the conv needs 3 rows more
+    while (pos->p2 < n2) {
+        int t0 = pos->p2, rows = n2 - t0 < TV_TILE ? n2 - t0 : TV_TILE;
+        int oldest = s->past > 0 && t0 > s->past ? t0 - s->past : 0;        // the oldest key these queries see
+        if ((pos->p1 - 1) / TV_KCH - oldest / TV_KCH >= s->ring) { fprintf(stderr, "tv: key ring too small\n"); abort(); }
         attn_job ja = {b, s, t0, rows, t0, 0, TV_HEADS / 2, 0, 0, 0, 0}, jb = {b, s, t0, rows, t0, TV_HEADS / 2, TV_HEADS, 1, 0, 0, 0};
         tv_parallel2(attn_run, &ja, &jb);
         tv_prof[TV_P_ATTN_DOT] += ja.t_qk + jb.t_qk;     // pass 1
         tv_prof[TV_P_ATTN_PV] += ja.t_pv + jb.t_pv;      // pass 2: dots again, weights, weights . values, codes
         snprintf(name, sizeof name, "%s.attn", prefix); dbg_tile(c, &s->d_attn, name, TV_I8, s->i8, t0, rows, TV_C, T);
         linear_add(c, &b->out, s->i8, rows, x + (size_t)t0 * TV_C);
+        pos->p2 += rows;
     }
     // ---- pass 3: depthwise conv over LayerNorm2 (3 rows of context), expand, GELU, project
-    float carry[3 * TV_C];                              // LayerNorm2 of the 3 rows before the tile, pre-update
-    for (int t0 = 0; t0 < T; t0 += TV_TILE) {
-        int rows = T - t0 < TV_TILE ? T - t0 : TV_TILE;
+    int n3 = pos->p2 == T ? T : pos->p2 > 3 ? pos->p2 - 3 : 0;
+    if (n3 > target) n3 = target;
+    while (pos->p3 < n3) {
+        int t0 = pos->p3, rows = n3 - t0 < TV_TILE ? n3 - t0 : TV_TILE;
         int last = t0 + rows + 3 < T ? t0 + rows + 3 : T;            // LayerNorm rows [t0, last) are fresh
         // ln2 row r stands for position t0 - 3 + r
-        if (t0 > 0) memcpy(s->ln2, carry, sizeof carry);
+        if (t0 > 0) memcpy(s->ln2, pos->carry, sizeof pos->carry);
         tile_parallel(TV_P_NORM, TILE_LN2, last - t0, b, s, x + (size_t)t0 * TV_C, t0, T);
-        if (t0 + rows < T) memcpy(carry, s->ln2 + (size_t)rows * TV_C, sizeof carry);  // positions t0+rows-3 ..
+        if (t0 + rows < T) memcpy(pos->carry, s->ln2 + (size_t)rows * TV_C, sizeof pos->carry);  // positions t0+rows-3 ..
         tile_parallel(TV_P_DW, TILE_DW, rows, b, s, NULL, t0, T);
         snprintf(name, sizeof name, "%s.dw", prefix); dbg_tile(c, &s->d_dw, name, TV_I8, s->i8, t0, rows, TV_C, T);
         int8_t *g = s->g8;
@@ -599,17 +654,22 @@ static void block_forward(ctx *c, const tv_block *b, const char *prefix, float *
         }
         snprintf(name, sizeof name, "%s.gelu", prefix); dbg_tile(c, &s->d_gelu, name, TV_I8, g, t0, rows, TV_FF, T);
         linear_add(c, &b->project, g, rows, x + (size_t)t0 * TV_C);
+        pos->p3 += rows;
     }
 }
 
 // x [T][C] is the residual input (overwritten); out receives the final LayerNorm (may alias x).
-static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x, int T, float *out) {
+// lookahead/past: the attention mask (0: full), see tv_options.acoustic_lookahead.
+static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x, int T, float *out, int lookahead, int past) {
     scratch s;
-    scratch_alloc(&s, T, c->opt->debug != NULL);
+    scratch_alloc(&s, T, c->opt->debug != NULL, 0);
+    s.lookahead = lookahead;
+    s.past = past;
     char buf[96];
     for (int i = 0; i < st->count; i++) {
         snprintf(buf, sizeof buf, "%s.blocks.%d", name, i);
-        block_forward(c, &st->blocks[i], buf, x, T, &s);
+        block_pos pos = {0};
+        block_advance(c, &st->blocks[i], buf, x, T, &s, &pos, T, T);
         snprintf(buf, sizeof buf, "%s.%d.out", name, i);
         dbg(c, buf, TV_F32, x, T, TV_C);
     }
@@ -662,29 +722,143 @@ static void collect_audio(void *user, const float *x, int n) {
     *cursor += n;
 }
 
-long tv_vocode(const tv_model *m, const float *ac, const float *pros, int T, const tv_options *opt, float *audio) {
-    ctx c = {opt, 0};
-    int8_t *q = xmalloc((size_t)T * TV_C);
-    quantize(ac, T * TV_C, m->s_voc, q);
-    dbg(&c, "voc.in", TV_I8, q, T, TV_C);
-    float *harm = xmalloc((size_t)T * 98 * sizeof(float)), *nz = xmalloc((size_t)T * 36 * sizeof(float));
-    float *f0 = xmalloc((size_t)T * sizeof(float));
-    linear_f(&c, &m->harmonic, q, T, harm);
-    linear_f(&c, &m->noise, q, T, nz);
-    for (int f = 0; f < T; f++) {
+// Vocoder inputs of `rows` frames from the final acoustic LayerNorm and the prosody: the head input
+// codes q, the harmonic and noise parameters and f0 in Hz.
+static void vocoder_inputs(ctx *c, const tv_model *m, const float *ac, const float *pros, int rows, int8_t *q,
+                           float *harm, float *nz, float *f0) {
+    quantize(ac, rows * TV_C, m->s_voc, q);
+    linear_f(c, &m->harmonic, q, rows, harm);
+    linear_f(c, &m->noise, q, rows, nz);
+    for (int f = 0; f < rows; f++) {
         float hz = 200.0f * expf(pros[f * 3]);
         f0[f] = hz < 50.0f ? 50.0f : hz > 600.0f ? 600.0f : hz;
     }
+}
+
+long tv_vocode(const tv_model *m, const float *ac, const float *pros, int T, const tv_options *opt, float *audio) {
+    ctx c = {opt, 0};
+    int8_t *q = xmalloc((size_t)T * TV_C);
+    float *harm = xmalloc((size_t)T * 98 * sizeof(float)), *nz = xmalloc((size_t)T * 36 * sizeof(float));
+    float *f0 = xmalloc((size_t)T * sizeof(float));
+    vocoder_inputs(&c, m, ac, pros, T, q, harm, nz, f0);
+    dbg(&c, "voc.in", TV_I8, q, T, TV_C);
     int S = T * TV_HOP;
     if (opt->on_audio) {
-        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, opt->on_audio, opt->audio_user);
+        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, 0, opt->on_audio, opt->audio_user, NULL, NULL);
     } else {
         float *cursor = audio;
-        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, collect_audio, &cursor);
+        tv_vocoder_stream(harm, nz, f0, opt->noise, opt->seed, T, 0, collect_audio, &cursor, NULL, NULL);
         dbg(&c, "audio", TV_F32, audio, 1, S);
     }
     tv_free(q); tv_free(harm); tv_free(nz); tv_free(f0);
     return c.saturations;
+}
+
+// ---------------------------------------------------------------- streaming acoustic stack
+// The acoustic stack runs a little ahead of the vocoder: before each vocoder block, every block
+// advances just far enough. With a look-ahead L, output row t of a block needs its input rows up
+// to t + L + 3 (the conv's 3 rows), and with a past window it attends to the last `past` rows
+// only, so keys, values, queries and the vocoder inputs live in rings that do not grow with the
+// utterance. Look-ahead 0 means full attention: every block runs over the whole utterance first,
+// exactly as without streaming. The rows are computed exactly as in one pass over the utterance.
+#define VOC_RING 256                // frames of vocoder input kept (it reads within ~110 of its position)
+typedef struct {
+    ctx *c;
+    const tv_model *m;
+    int T, D;                       // D: input rows a block needs beyond its output rows
+    float *x;                       // residual [T][C] (overwritten)
+    const float *pros;
+    scratch s;                      // shared tile buffers and queries; kh/vt point at the current block's
+    int8_t **kh, **vt;              // per block
+    block_pos *pos;                 // per block
+    int vring;                      // rows of harm, nz and f0 (a ring of VOC_RING, or T)
+    float *harm, *nz, *f0;          // vocoder inputs [vring][98], [vring][36], [vring]
+    float *ac_t, *harm_t, *nz_t, *f0_t;     // one step (at most TV_TILE rows) before it goes into the rings
+    int8_t *q_t;
+    int done;                       // rows of the vocoder inputs that are final
+} acoustic_stream;
+
+// Makes stack output rows [done, e) final (at most TV_TILE of them) and turns them into vocoder inputs.
+static void acoustic_step(acoustic_stream *a, int e) {
+    const tv_stack *st = &a->m->acoustic;
+    const int T = a->T, n = st->count;
+    char name[96];
+    if (a->s.ring < a->s.nchunks) {     // block 0 writes queries up to here; no block may still need the old ones
+        long newest = e + (long)(n - 1) * a->D + a->s.lookahead + TV_KERNEL / 2;
+        int oldest = a->pos[n - 1].p2;
+        for (int l = 0; l < n; l++) if (a->pos[l].p2 < oldest) oldest = a->pos[l].p2;
+        if ((newest < T ? newest : T) - oldest > (long)kv_rows(&a->s)) { fprintf(stderr, "tv: query ring too small\n"); abort(); }
+    }
+    for (int l = 0; l < n; l++) {
+        long target = e + (long)(n - 1 - l) * a->D;
+        a->s.kh = a->kh[l]; a->s.vt = a->vt[l];
+        snprintf(name, sizeof name, "acoustic_stack.blocks.%d", l);
+        block_advance(a->c, &st->blocks[l], name, a->x, T, &a->s, &a->pos[l], l ? a->pos[l - 1].p3 : T,
+                      target < T ? (int)target : T);
+    }
+    if (a->pos[n - 1].p3 < e) { fprintf(stderr, "tv: acoustic stream stalled at %d of %d\n", a->pos[n - 1].p3, e); abort(); }
+    // final LayerNorm and vocoder inputs of the new rows, copied into the rings
+    const int r0 = a->done, rows = e - r0;
+    TV_PROF(TV_P_NORM, layer_norm_rows(a->x + (size_t)r0 * TV_C, 0, rows, TV_C, st->norm_w, st->norm_b, a->ac_t));
+    vocoder_inputs(a->c, a->m, a->ac_t, a->pros + (size_t)r0 * 3, rows, a->q_t, a->harm_t, a->nz_t, a->f0_t);
+    for (int r = 0; r < rows; r++) {
+        int slot = (r0 + r) % a->vring;
+        memcpy(a->harm + (size_t)slot * 98, a->harm_t + (size_t)r * 98, 98 * sizeof(float));
+        memcpy(a->nz + (size_t)slot * 36, a->nz_t + (size_t)r * 36, 36 * sizeof(float));
+        a->f0[slot] = a->f0_t[r];
+    }
+    a->done = e;
+}
+
+static void acoustic_advance(void *user, int frames) {
+    acoustic_stream *a = user;
+    if (frames <= a->done) return;
+    // after the first rows (as few as the vocoder needs: sound starts sooner), whole tiles: faster matmuls
+    int E = a->done && frames < a->done + TV_TILE ? a->done + TV_TILE : frames;
+    if (E > a->T) E = a->T;
+    // the vocoder still reads frames from about frames - 48 on: they must not be overwritten
+    if (a->vring < a->T && E - (frames - 48) > a->vring) { fprintf(stderr, "tv: vocoder ring too small\n"); abort(); }
+    while (a->done < E) acoustic_step(a, E - a->done > TV_TILE ? a->done + TV_TILE : E);
+}
+
+static void acoustic_stream_run(ctx *c, const tv_model *m, float *x, const float *pros, int T, int L, int P,
+                                const tv_options *opt, float *audio) {
+    acoustic_stream a = {.c = c, .m = m, .T = T, .D = L ? L + TV_KERNEL / 2 : T, .x = x, .pros = pros};
+    const int n = m->acoustic.count;
+    // Rows the rings must hold: a block's keys from its oldest query - P to its newest + L + 3 plus
+    // one step, and the queries of all blocks at once (block 0 runs (n-1) * D rows ahead of the last).
+    long keys = (long)P + L + TV_KERNEL / 2 + TV_TILE, queries = (long)(n - 1) * a.D + L + TV_KERNEL / 2 + 2 * TV_TILE;
+    long rows = keys > queries ? keys : queries;
+    int ring = P > 0 && rows < T ? (int)((rows + TV_KCH - 1) / TV_KCH) + 1 : 0;
+    scratch_alloc(&a.s, T, 0, ring);
+    a.s.lookahead = L;
+    a.s.past = P;
+    a.kh = xmalloc(n * sizeof *a.kh);
+    a.vt = xmalloc(n * sizeof *a.vt);
+    a.pos = xmalloc(n * sizeof *a.pos);
+    memset(a.pos, 0, n * sizeof *a.pos);
+    for (int l = 0; l < n; l++) {         // without a look-ahead the blocks run one after the other: one set
+        if (l && L) kv_alloc(&a.s, &a.kh[l], &a.vt[l]);
+        else { a.kh[l] = a.s.kh; a.vt[l] = a.s.vt; }
+    }
+    a.vring = L && T > VOC_RING ? VOC_RING : T;
+    a.harm = xmalloc((size_t)a.vring * 98 * sizeof(float));
+    a.nz = xmalloc((size_t)a.vring * 36 * sizeof(float));
+    a.f0 = xmalloc((size_t)a.vring * sizeof(float));
+    a.ac_t = xmalloc((size_t)TV_TILE * TV_C * sizeof(float));
+    a.harm_t = xmalloc((size_t)TV_TILE * 98 * sizeof(float));
+    a.nz_t = xmalloc((size_t)TV_TILE * 36 * sizeof(float));
+    a.f0_t = xmalloc((size_t)TV_TILE * sizeof(float));
+    a.q_t = xmalloc((size_t)TV_TILE * TV_C);
+    float *cursor = audio;
+    tv_vocoder_stream(a.harm, a.nz, a.f0, opt->noise, opt->seed, T, a.vring, opt->on_audio ? opt->on_audio : collect_audio,
+                      opt->on_audio ? opt->audio_user : (void *)&cursor, acoustic_advance, &a);
+    for (int l = 1; l < n && L; l++) { tv_free(a.kh[l]); tv_free(a.vt[l]); }
+    a.s.kh = a.kh[0]; a.s.vt = a.vt[0];
+    scratch_free(&a.s);
+    tv_free(a.kh); tv_free(a.vt); tv_free(a.pos);
+    tv_free(a.harm); tv_free(a.nz); tv_free(a.f0);
+    tv_free(a.ac_t); tv_free(a.harm_t); tv_free(a.nz_t); tv_free(a.f0_t); tv_free(a.q_t);
 }
 
 int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, int N, int voice,
@@ -697,7 +871,7 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
     for (int t = 0; t < N; t++)
         for (int i = 0; i < TV_C; i++)
             x[t * TV_C + i] = m->tokens[ids[t] * TV_C + i] + m->stress[stress[t] * TV_C + i] + m->voices[voice * TV_C + i];
-    stack_forward(&c, &m->encoder, "encoder", x, N, hidden);
+    stack_forward(&c, &m->encoder, "encoder", x, N, hidden, 0, 0);
     // ---- durations
     int32_t *dur = xmalloc((size_t)N * sizeof(int32_t));
     predict_durations(&c, m, hidden, ids, N, opt->speed > 0 ? opt->speed : 1.0f, dur);
@@ -712,7 +886,7 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
         return TV_TOO_LONG;
     }
     // ---- repeat token states by duration, add position-in-token and voice
-    float *frames = xmalloc((size_t)T * TV_C * sizeof(float)), *ph = xmalloc((size_t)T * TV_C * sizeof(float));
+    float *frames = xmalloc((size_t)T * TV_C * sizeof(float));
     uint8_t *vowel = xmalloc(T);
     for (int t = 0, f = 0; t < N; t++) {
         int owned = dur[t] < 1 ? 1 : dur[t];
@@ -728,12 +902,12 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
             }
         }
     }
-    // ---- prosody
-    stack_forward(&c, &m->prosody, "prosody_stack", frames, T, ph);
+    // ---- prosody (its output replaces the frames; each row is read whole before it is overwritten)
+    stack_forward(&c, &m->prosody, "prosody_stack", frames, T, frames, 0, 0);
     float *pros = xmalloc((size_t)T * 3 * sizeof(float));
-    float *ac_in = frames;                              // reuse
+    float *ac_in = frames;
     for (int f = 0; f < T; f++) {
-        const float *row = ph + (size_t)f * TV_C;
+        const float *row = frames + (size_t)f * TV_C;
         for (int o = 0; o < 3; o++) {
             float v = m->prosody_head_b[o];
             for (int i = 0; i < TV_C; i++) v += m->prosody_head_w[o * TV_C + i] * row[i];
@@ -749,18 +923,21 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
         }
     }
     dbg(&c, "prosody", TV_F32, pros, T, 3);
-    // ---- acoustic
-    float *ac = ph;                                     // final LN of the acoustic stack overwrites ph
-    stack_forward(&c, &m->acoustic, "acoustic_stack", ac_in, T, ac);
-    dbg(&c, "acoustic", TV_F32, ac, T, TV_C);
-    // ---- vocoder heads (int8) and source-filter synthesis (float)
+    // ---- acoustic stack, vocoder heads (int8) and source-filter synthesis (float)
     int S = T * TV_HOP;
     res->audio = opt->on_audio ? NULL : xmalloc((size_t)S * sizeof(float));
-    c.saturations += tv_vocode(m, ac, pros, T, opt, res->audio);
+    const int L = opt->acoustic_lookahead > 0 ? opt->acoustic_lookahead : 0, P = L ? opt->acoustic_past : 0;
+    if (!opt->debug) {
+        acoustic_stream_run(&c, m, ac_in, pros, T, L, P, opt, res->audio);     // computed as the vocoder needs it
+    } else {        // reference: one pass with the same mask, every tensor whole for the debug dumps
+        stack_forward(&c, &m->acoustic, "acoustic_stack", ac_in, T, ac_in, L, P);  // the final LN replaces ac_in
+        dbg(&c, "acoustic", TV_F32, ac_in, T, TV_C);
+        c.saturations += tv_vocode(m, ac_in, pros, T, opt, res->audio);
+    }
     res->n_samples = S;
     res->n_frames = T;
     res->durations = dur;
     res->qacc_saturations = c.saturations;
-    tv_free(x); tv_free(hidden); tv_free(frames); tv_free(ph); tv_free(vowel); tv_free(pros);
+    tv_free(x); tv_free(hidden); tv_free(frames); tv_free(vowel); tv_free(pros);
     return 0;
 }

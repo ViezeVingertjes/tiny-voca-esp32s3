@@ -165,8 +165,8 @@ static float lifter(int i, int first) {
 // Band-limited pulse train with unit power (model.py pulse_train), produced sample by sample.
 // The phase is kept in double cycles (exact enough over minutes); everything else is float.
 typedef struct {
-    const float *f0;
-    int T, s;                   // next sample index
+    const float *f0;            // frame f at f % ring
+    int T, ring, s;             // s: next sample index
     uint64_t n;                 // the phase in units of 2^-52 while `inexact` is 0 (see phase_step)
     double cycles;              // the phase once a step left that range
     int inexact;
@@ -209,8 +209,9 @@ static float pulse_next(pulse_gen *g) {
     if (i == 0) {
         const float *f0 = g->f0;
         int n = f + 1 < g->T ? f + 1 : g->T - 1;
-        g->k0 = logf(f0[f] < 1 ? 1.0f : f0[f]);
-        g->k1 = logf(f0[n] < 1 ? 1.0f : f0[n]);
+        float a = f0[f % g->ring], b = f0[n % g->ring];
+        g->k0 = logf(a < 1 ? 1.0f : a);
+        g->k1 = logf(b < 1 ? 1.0f : b);
     }
     g->s++;
     float w = (float)i / TV_HOP;
@@ -261,8 +262,8 @@ typedef struct {
 } branch;
 
 typedef struct {
-    const float *h, *n;         // head outputs [T][98], [T][36]
-    int T;
+    const float *h, *n;         // head outputs [ring][98], [ring][36]: frame f at f % ring
+    int T, ring;
     pulse_gen pulses;
     const float *noise;         // given noise, or NULL for the generator
     uint64_t rng;
@@ -295,16 +296,16 @@ static void response(branch *b, const sources *src, int j) {
         float causal[CEP_CAUSAL], anti[CEP_ANTI];
         int sub = j < steps * T - 1 ? j : steps * T - 1;
         int here = sub / steps, next = (sub + 1) / steps < T - 1 ? (sub + 1) / steps : T - 1;
-        const float *a = src->h + (size_t)here * 98, *c = src->h + (size_t)next * 98;
+        const float *a = src->h + (size_t)(here % src->ring) * 98, *c = src->h + (size_t)(next % src->ring) * 98;
         for (int i = 0; i < CEP_CAUSAL; i++) causal[i] = 0.5f * (a[i] + c[i]) * lifter(i, 0);
         for (int i = 0; i < CEP_ANTI; i++) anti[i] = 0.5f * (a[CEP_CAUSAL + i] + c[CEP_CAUSAL + i]) * lifter(i, 1);
-        causal[0] += src->h[(size_t)(sub / steps) * 98 + CEP_CAUSAL + CEP_ANTI + sub % steps];
+        causal[0] += src->h[(size_t)(sub / steps % src->ring) * 98 + CEP_CAUSAL + CEP_ANTI + sub % steps];
         cepstrum_response(causal, CEP_CAUSAL, anti, CEP_ANTI, SYNTH_FFT, b->rr, b->ri, b->buf, b->tr, b->ti);
     } else {
         const int steps = TV_HOP / NOISE_HOP;
         float ncep[NOISE_CEP];
         int sub = j < steps * T - 1 ? j : steps * T - 1;
-        const float *a = src->n + (size_t)(sub / steps) * 36;
+        const float *a = src->n + (size_t)(sub / steps % src->ring) * 36;
         for (int i = 0; i < NOISE_CEP; i++) ncep[i] = a[i] * lifter(i, 0);
         ncep[0] += a[NOISE_CEP + sub % steps];
         cepstrum_response(ncep, NOISE_CEP, NULL, 0, NOISE_FFT, b->rr, b->ri, b->buf, b->tr, b->ti);
@@ -360,12 +361,13 @@ static void branch_run(void *arg) {
     while (j->b->produced < j->target && j->b->m < j->b->frames) branch_step(j->b, j->src);
 }
 
-void tv_vocoder_stream(const float *h, const float *n, const float *f0, const float *noise, uint64_t seed, int T,
-                       tv_audio_fn sink, void *user) {
+void tv_vocoder_stream(const float *h, const float *n, const float *f0, const float *noise, uint64_t seed, int T, int ring,
+                       tv_audio_fn sink, void *user, tv_need_fn need, void *need_user) {
+    if (ring <= 0) ring = T;
     const int S = T * TV_HOP;
     branch *hb = malloc(sizeof(branch)), *nb = malloc(sizeof(branch));
     float *out = malloc(VOC_BLOCK * sizeof(float));
-    sources src = {h, n, T, {f0, T, 0, 0, 0.0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
+    sources src = {h, n, T, ring, {f0, T, ring, 0, 0, 0.0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
     branch_init(hb, SYNTH_FFT, SYNTH_HOP, 1, S);
     branch_init(nb, NOISE_FFT, NOISE_HOP, 0, S);
     int emitted = 0;
@@ -373,6 +375,10 @@ void tv_vocoder_stream(const float *h, const float *n, const float *f0, const fl
         // Both branches advance on their own core until they cover the next block.
         int block = emitted >= VOC_BLOCK / 2 ? VOC_BLOCK : emitted ? VOC_BLOCK / 2 : VOC_BLOCK / 4;  // short first blocks: sound starts sooner
         int target = emitted + block < S ? emitted + block : S;
+        if (need) {     // a block reads source samples up to target + fft and frames one past them
+            int frames = (target + SYNTH_FFT) / TV_HOP + 3;
+            need(need_user, frames < T ? frames : T);
+        }
         branch_job jh = {hb, &src, target}, jn = {nb, &src, target};
         tv_parallel2(branch_run, &jh, &jn);
         int k = target - emitted;
@@ -394,5 +400,5 @@ static void collect(void *user, const float *x, int n) {
 
 void tv_vocoder(const float *h, const float *n, const float *f0, const float *noise, int T, float *audio) {
     collect_state c = {audio, 0};
-    tv_vocoder_stream(h, n, f0, noise, 0, T, collect, &c);
+    tv_vocoder_stream(h, n, f0, noise, 0, T, 0, collect, &c, NULL, NULL);
 }

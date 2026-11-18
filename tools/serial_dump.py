@@ -23,7 +23,7 @@ while s is None:
     try:
         s = serial.Serial()
         s.port, s.baudrate, s.timeout = port, 115200, 0.2
-        s.dtr = s.rts = False
+        s.rts = False  # only RTS: DTR low with RTS high resets the S3
         s.open()
     except Exception:
         s = None

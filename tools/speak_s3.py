@@ -65,7 +65,7 @@ class Board:
     def __init__(self, port):
         self.s = serial.Serial()
         self.s.port, self.s.baudrate, self.s.timeout = port, 115200, 0.2
-        self.s.dtr = self.s.rts = False          # do not reset the chip on open
+        self.s.rts = False  # only RTS: DTR low with RTS high resets the S3
         self.s.open()
         self.buf = b""
 

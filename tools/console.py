@@ -50,6 +50,8 @@ if args.boot:
     until_ready()
 else:
     s.write(b"\n"); until_ready(echo=False)
+    # A board still booting answers twice (its boot READY, then the empty line): drop the second.
+    time.sleep(0.3); s.reset_input_buffer(); buf = b""
 for line in args.lines:
     print(f">>> {line}", flush=True)
     t0 = time.time()

@@ -3,12 +3,19 @@ Hard deadline. With --boot, first resets the board and prints its boot log up to
 
     python tools/console.py --boot "Hello there." "voice F2" "How are you?"
 """
-import argparse, signal, sys, time
+import argparse, glob, signal, sys, time
 import serial
+
+
+def default_port():
+    """The first /dev/ttyACM* (Linux) or /dev/cu.usbmodem* (macOS): the S3's USB Serial/JTAG."""
+    found = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/cu.usbmodem*"))
+    return found[0] if found else "/dev/ttyACM0"
+
 
 ap = argparse.ArgumentParser()
 ap.add_argument("lines", nargs="*")
-ap.add_argument("--port", default="/dev/cu.usbmodem1201")
+ap.add_argument("--port", default=default_port())
 ap.add_argument("--boot", action="store_true", help="reset the board and show the boot log")
 ap.add_argument("--timeout", type=int, default=300)
 args = ap.parse_args()
@@ -58,6 +65,8 @@ if args.boot:
     until_ready()
 else:
     s.write(b"\n"); until_ready(echo=False)
+    # A board still booting answers twice (its boot READY, then the empty line): drop the second.
+    time.sleep(0.3); s.reset_input_buffer(); buf = b""
 for line in args.lines:
     print(f">>> {line}", flush=True)
     t0 = time.time()

@@ -3,8 +3,11 @@
 #include "tv.h"
 #include "tv_kernels.h"
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define SYNTH_FFT 512
 #define SYNTH_HOP 128
@@ -50,12 +53,14 @@ static inline void fast_sincosf(float x, float *s, float *c) {
 }
 
 // ---------------------------------------------------------------- FFT with cached tables
-// Complex radix-2 FFT of size m (128 or 256) used for real FFTs of size 2m.
+// Complex radix-2 FFT of size m (128 or 256) used for real FFTs of size 2m, and the periodic Hann
+// window of size 2m. Made on first use (branch_init, before the branches run on the two cores).
 typedef struct {
     int m;
     float *tw_re, *tw_im;       // exp(-2 pi i j / m), j < m/2
     float *rw_re, *rw_im;       // exp(-2 pi i k / 2m), k <= m (real-FFT split)
     uint16_t *rev;
+    float *window, *win2;       // [2m] Hann window and its square
 } fft_plan;
 
 static fft_plan plans[2];
@@ -64,11 +69,16 @@ static const fft_plan *plan_for(int n) {           // n = real size (256 or 512)
     int m = n / 2;
     fft_plan *p = &plans[m == 256];
     if (p->m == m) return p;
-    p->tw_re = malloc(m / 2 * sizeof(float)); p->tw_im = malloc(m / 2 * sizeof(float));
-    p->rw_re = malloc((m + 1) * sizeof(float)); p->rw_im = malloc((m + 1) * sizeof(float));
-    p->rev = malloc(m * sizeof(uint16_t));
+    p->tw_re = tv_alloc(m / 2 * sizeof(float)); p->tw_im = tv_alloc(m / 2 * sizeof(float));
+    p->rw_re = tv_alloc((m + 1) * sizeof(float)); p->rw_im = tv_alloc((m + 1) * sizeof(float));
+    p->rev = tv_alloc(m * sizeof(uint16_t));
+    p->window = tv_alloc(n * sizeof(float)); p->win2 = tv_alloc(n * sizeof(float));
     for (int j = 0; j < m / 2; j++) { p->tw_re[j] = (float)cos(-2 * M_PI * j / m); p->tw_im[j] = (float)sin(-2 * M_PI * j / m); }
     for (int k = 0; k <= m; k++) { p->rw_re[k] = (float)cos(-2 * M_PI * k / n); p->rw_im[k] = (float)sin(-2 * M_PI * k / n); }
+    for (int i = 0; i < n; i++) {
+        p->window[i] = (float)(0.5 - 0.5 * cos(2 * M_PI * i / n));
+        p->win2[i] = p->window[i] * p->window[i];
+    }
     int bits = 0;
     while ((1 << bits) < m) bits++;
     for (int i = 0; i < m; i++) {
@@ -126,8 +136,7 @@ static void irfft(const float *re, const float *im, int n, float *x, float *zr, 
     int m = n / 2;
     for (int k = 0; k < m; k++) {
         float ar = re[k], ai = k ? im[k] : 0.0f;
-        float br = re[m - k], bi = (m - k) == m ? 0.0f : -im[m - k];         // conj X[m-k]
-        if (k == 0) bi = 0.0f;
+        float br = re[m - k], bi = k ? -im[m - k] : 0.0f;                      // conj X[m-k]
         float er = 0.5f * (ar + br), ei = 0.5f * (ai + bi);
         float dr = 0.5f * (ar - br), di = 0.5f * (ai - bi);
         float wr = p->rw_re[k], wi = -p->rw_im[k];                            // conj W^k
@@ -163,7 +172,7 @@ static float lifter(int i, int first) {
 }
 
 // Band-limited pulse train with unit power (model.py pulse_train), produced sample by sample.
-// The phase is kept in double cycles (exact enough over minutes); everything else is float.
+// The phase is an integer in units of 2^-52 (see phase_step); everything else is float.
 typedef struct {
     const float *f0;            // frame f at f % ring
     int T, ring, s;             // s: next sample index
@@ -253,31 +262,31 @@ typedef struct {
     int m;                      // next frame
     int pos;                    // padded index of the next source sample to read
     int harmonic;               // 1: pulses + harmonic response, 0: noise + noise response
-    float win[SYNTH_FFT], win2[SYNTH_FFT], window[SYNTH_FFT], ola[SYNTH_FFT], env[SYNTH_FFT];
+    const float *window, *win2; // [fft] Hann window and its square (from the FFT plan)
+    float win[SYNTH_FFT], ola[SYNTH_FFT], env[SYNTH_FFT];
     float re[SYNTH_FFT / 2 + 1], im[SYNTH_FFT / 2 + 1], rr[SYNTH_FFT / 2 + 1], ri[SYNTH_FFT / 2 + 1];
     float seg[SYNTH_FFT], buf[SYNTH_FFT], tr[SYNTH_FFT], ti[SYNTH_FFT];
     float fifo[FIFO_SIZE];
     int count;                  // samples waiting in fifo
     int produced;               // samples ever appended to fifo
+    uint64_t t_cep, t_shape;    // profile (this branch's core; added up after each block)
 } branch;
 
 typedef struct {
-    const float *h, *n;         // head outputs [ring][98], [ring][36]: frame f at f % ring
+    const float *h, *n;         // head outputs [ring][TV_HARM_PARAMS], [ring][TV_NOISE_PARAMS]: frame f at f % ring
     int T, ring;
     pulse_gen pulses;
     const float *noise;         // given noise, or NULL for the generator
     uint64_t rng;
-    int noise_pos;
 } sources;
 
 static void branch_init(branch *b, int fft_n, int hop, int harmonic, int S) {
     memset(b, 0, sizeof *b);
     b->fft = fft_n, b->hop = hop, b->bins = fft_n / 2 + 1, b->S = S, b->P = fft_n / 2, b->harmonic = harmonic;
     b->frames = 1 + (S + fft_n / 2) / hop;
-    for (int i = 0; i < fft_n; i++) {
-        b->window[i] = (float)(0.5 - 0.5 * cos(2 * M_PI * i / fft_n));
-        b->win2[i] = b->window[i] * b->window[i];
-    }
+    const fft_plan *p = plan_for(fft_n);
+    b->window = p->window;
+    b->win2 = p->win2;
 }
 
 static float next_source(branch *b, sources *src) {
@@ -285,7 +294,6 @@ static float next_source(branch *b, sources *src) {
     int i = j - b->P;                                   // index in the unpadded source
     if (i < 0 || i >= b->S) return 0.0f;                // centre padding and the fft/2 trailing zeros
     if (b->harmonic) return pulse_next(&src->pulses);
-    src->noise_pos++;
     return src->noise ? src->noise[i] : gaussian(&src->rng);
 }
 
@@ -296,16 +304,16 @@ static void response(branch *b, const sources *src, int j) {
         float causal[CEP_CAUSAL], anti[CEP_ANTI];
         int sub = j < steps * T - 1 ? j : steps * T - 1;
         int here = sub / steps, next = (sub + 1) / steps < T - 1 ? (sub + 1) / steps : T - 1;
-        const float *a = src->h + (size_t)(here % src->ring) * 98, *c = src->h + (size_t)(next % src->ring) * 98;
+        const float *a = src->h + (size_t)(here % src->ring) * TV_HARM_PARAMS, *c = src->h + (size_t)(next % src->ring) * TV_HARM_PARAMS;
         for (int i = 0; i < CEP_CAUSAL; i++) causal[i] = 0.5f * (a[i] + c[i]) * lifter(i, 0);
         for (int i = 0; i < CEP_ANTI; i++) anti[i] = 0.5f * (a[CEP_CAUSAL + i] + c[CEP_CAUSAL + i]) * lifter(i, 1);
-        causal[0] += src->h[(size_t)(sub / steps % src->ring) * 98 + CEP_CAUSAL + CEP_ANTI + sub % steps];
+        causal[0] += src->h[(size_t)(sub / steps % src->ring) * TV_HARM_PARAMS + CEP_CAUSAL + CEP_ANTI + sub % steps];
         cepstrum_response(causal, CEP_CAUSAL, anti, CEP_ANTI, SYNTH_FFT, b->rr, b->ri, b->buf, b->tr, b->ti);
     } else {
         const int steps = TV_HOP / NOISE_HOP;
         float ncep[NOISE_CEP];
         int sub = j < steps * T - 1 ? j : steps * T - 1;
-        const float *a = src->n + (size_t)(sub / steps % src->ring) * 36;
+        const float *a = src->n + (size_t)(sub / steps % src->ring) * TV_NOISE_PARAMS;
         for (int i = 0; i < NOISE_CEP; i++) ncep[i] = a[i] * lifter(i, 0);
         ncep[0] += a[NOISE_CEP + sub % steps];
         cepstrum_response(ncep, NOISE_CEP, NULL, 0, NOISE_FFT, b->rr, b->ri, b->buf, b->tr, b->ti);
@@ -323,8 +331,8 @@ static void branch_step(branch *b, sources *src) {
     }
     uint64_t t0 = tv_time_us();
     response(b, src, m);
-    tv_prof[TV_P_VOC_CEP] += tv_time_us() - t0;
-    t0 = tv_time_us();
+    uint64_t t1 = tv_time_us();
+    b->t_cep += t1 - t0;
     for (int i = 0; i < fft_n; i++) b->seg[i] = b->win[(o + i) & mask] * b->window[i];
     rfft(b->seg, fft_n, b->re, b->im, b->tr, b->ti);
     for (int k = 0; k < b->bins; k++) {
@@ -347,7 +355,7 @@ static void branch_step(branch *b, sources *src) {
         b->produced++;
     }
     b->m++;
-    tv_prof[TV_P_VOC_SHAPE] += tv_time_us() - t0;
+    b->t_shape += tv_time_us() - t1;
 }
 
 typedef struct {
@@ -365,9 +373,8 @@ void tv_vocoder_stream(const float *h, const float *n, const float *f0, const fl
                        tv_audio_fn sink, void *user, tv_need_fn need, void *need_user) {
     if (ring <= 0) ring = T;
     const int S = T * TV_HOP;
-    branch *hb = malloc(sizeof(branch)), *nb = malloc(sizeof(branch));
-    float *out = malloc(VOC_BLOCK * sizeof(float));
-    sources src = {h, n, T, ring, {f0, T, ring, 0, 0, 0.0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1), 0};
+    branch *hb = tv_alloc(sizeof(branch)), *nb = tv_alloc(sizeof(branch));
+    sources src = {h, n, T, ring, {f0, T, ring, 0, 0, 0.0, 0, 0, 0}, noise, 0x9E3779B97F4A7C15ULL ^ (seed << 1 | 1)};
     branch_init(hb, SYNTH_FFT, SYNTH_HOP, 1, S);
     branch_init(nb, NOISE_FFT, NOISE_HOP, 0, S);
     int emitted = 0;
@@ -382,23 +389,13 @@ void tv_vocoder_stream(const float *h, const float *n, const float *f0, const fl
         branch_job jh = {hb, &src, target}, jn = {nb, &src, target};
         tv_parallel2(branch_run, &jh, &jn);
         int k = target - emitted;
-        for (int i = 0; i < k; i++) out[i] = hb->fifo[i] + nb->fifo[i];
+        for (int i = 0; i < k; i++) hb->fifo[i] += nb->fifo[i];       // the two branches, mixed in place
+        sink(user, hb->fifo, k);
         memmove(hb->fifo, hb->fifo + k, (hb->count - k) * sizeof(float)); hb->count -= k;
         memmove(nb->fifo, nb->fifo + k, (nb->count - k) * sizeof(float)); nb->count -= k;
-        sink(user, out, k);
         emitted += k;
     }
-    free(hb); free(nb); free(out);
-}
-
-typedef struct { float *dst; int n; } collect_state;
-static void collect(void *user, const float *x, int n) {
-    collect_state *c = user;
-    memcpy(c->dst + c->n, x, n * sizeof(float));
-    c->n += n;
-}
-
-void tv_vocoder(const float *h, const float *n, const float *f0, const float *noise, int T, float *audio) {
-    collect_state c = {audio, 0};
-    tv_vocoder_stream(h, n, f0, noise, 0, T, 0, collect, &c, NULL, NULL);
+    tv_prof[TV_P_VOC_CEP] += hb->t_cep + nb->t_cep;
+    tv_prof[TV_P_VOC_SHAPE] += hb->t_shape + nb->t_shape;
+    tv_free(hb); tv_free(nb);
 }

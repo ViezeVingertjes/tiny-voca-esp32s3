@@ -1,6 +1,7 @@
-// tiny-voca on the ESP32-S3: run the test vector from the `testvec` partition with the
-// model from the `model` partition, report timings, and stream prosody + audio back over
-// the console as base64 ("TVDUMP" blocks, decoded by esp32/tools/serial_dump.py).
+// tiny-voca on the ESP32-S3: a console that speaks typed text (phonemizer, synthesis, speaker),
+// with the model mapped from the `model` partition. Commands for the tools: TEST runs the test
+// vector from the `testvec` partition and streams prosody + audio back as base64 ("TVDUMP"
+// blocks, decoded by tools/serial_dump.py); SYN synthesizes given tokens (tools/speak_s3.py).
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -72,6 +73,8 @@ static void on_tensor(void *user, const char *name, int dtype, const void *data,
     }
 }
 
+#define MAX_TOKENS 512             // phonemes per utterance (the console splits longer text)
+
 static tv_model model;
 static tv_file test;
 static int have_test;
@@ -79,14 +82,17 @@ static int have_test;
 static void run_test(void) {
     if (!have_test) { printf("no test vector\n"); return; }
     const tv_entry *ids_e = tv_file_find(&test, "ids"), *noise_e = tv_file_find(&test, "noise");
-    int n = ids_e->shape[0];
+    int n = ids_e ? (int)ids_e->shape[0] : 0;
+    const int32_t *ids = tv_file_get(&test, "ids", TV_I32, n), *stress = tv_file_get(&test, "stress", TV_I32, n);
+    const int32_t *voice = tv_file_get(&test, "voice", TV_I32, 1);
     run_state st = {.golden_durations = tv_file_get(&test, "durations", TV_I32, n)};
-    tv_options opt = {.speed = 1.0f, .noise = (const float *)(test.base + noise_e->offset), .debug = on_tensor, .debug_user = &st};
+    if (!ids || !stress || !voice || !noise_e || !st.golden_durations) { printf("no test vector (testvec is not test0_dev.bin)\n"); return; }
+    tv_options opt = {.speed = 1.0f, .noise = (const float *)(test.base + noise_e->offset), .noise_len = noise_e->nbytes / 4,
+                      .debug = on_tensor, .debug_user = &st};
     tv_result r;
     tv_profile_reset();
     st.t0 = esp_timer_get_time();
-    int rc = tv_synthesize(&model, tv_file_get(&test, "ids", TV_I32, n), tv_file_get(&test, "stress", TV_I32, n), n,
-                           *(const int32_t *)tv_file_get(&test, "voice", TV_I32, 1), &opt, &r);
+    int rc = tv_synthesize(&model, ids, stress, n, *voice, &opt, &r);
     double ms = (esp_timer_get_time() - st.t0) / 1000.0;
     if (rc) { printf("synthesize failed: %d\n", rc); return; }
     double audio_ms = 1000.0 * r.n_samples / TV_SAMPLE_RATE;
@@ -98,8 +104,7 @@ static void run_test(void) {
         o2.debug = NULL;
         tv_result r2;
         int64_t t1 = esp_timer_get_time();
-        if (tv_synthesize(&model, tv_file_get(&test, "ids", TV_I32, n), tv_file_get(&test, "stress", TV_I32, n), n,
-                          *(const int32_t *)tv_file_get(&test, "voice", TV_I32, 1), &o2, &r2) == 0) {
+        if (tv_synthesize(&model, ids, stress, n, *voice, &o2, &r2) == 0) {
             int same = r2.n_samples == r.n_samples && !memcmp(r2.audio, r.audio, (size_t)r.n_samples * 4);
             printf("production path: %.0f ms, audio %s\n", (esp_timer_get_time() - t1) / 1000.0, same ? "bit-identical" : "DIFFERS");
             tv_free(r2.audio); tv_free(r2.durations);
@@ -112,25 +117,51 @@ static void run_test(void) {
     printf("TVDUMP_DONE\n");
 }
 
+// The acoustic stack is streamed into the vocoder: a frame sees 32 frames ahead and 512 back, so
+// sound starts early and its memory stays fixed. "look 0" switches to full attention (the
+// reference numerics; sound starts only once the whole acoustic stack is done).
+static int acoustic_lookahead = 32;
+#define ACOUSTIC_PAST 512
+
+// Frames that fit in the free PSRAM. Streaming with a past window: ~2.7 MB fixed (key and value
+// rings, the token states; 3 MB with a margin) plus ~1.3 KB per frame, measured; full attention:
+// ~2.9 KB per frame. The largest single buffer is T x 768 bytes. keep_audio: the whole utterance
+// is returned as float audio (1 KB per frame, then one buffer) and converted to 16 bits (0.5 KB).
+// The model itself handles at most 3000 frames.
+static int frame_budget(int lookahead, int keep_audio) {
+    long fixed = lookahead > 0 ? 3000 * 1024 : 1200 * 1024, bytes_per_frame = lookahead > 0 ? 1300 : 2900;
+    long largest_per_frame = 800;
+    if (keep_audio) { bytes_per_frame += 1536; largest_per_frame = 1100; }
+    long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - fixed;
+    long largest = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 64 * 1024;
+    long frames = total / bytes_per_frame;
+    if (largest / largest_per_frame < frames) frames = largest / largest_per_frame;
+    if (frames > 3000) frames = 3000;
+    return frames > 0 ? (int)frames : 0;
+}
+
 // SYN <voice> <seed> <n> <id,id,...> <stress,stress,...>
 static void run_syn(char *line) {
     int voice, n;
     unsigned seed;
     char *rest;
-    if (sscanf(line, "SYN %d %u %d", &voice, &seed, &n) != 3 || n < 1 || n > 512) { printf("ERR bad command\n"); return; }
+    if (sscanf(line, "SYN %d %u %d", &voice, &seed, &n) != 3 || n < 1 || n > MAX_TOKENS) { printf("ERR bad command\n"); return; }
     rest = line;
     for (int i = 0; i < 4 && rest; i++) rest = strchr(rest + 1, ' ');
     int32_t *ids = tv_alloc(n * 4), *stress = tv_alloc(n * 4);
     char *tok = rest ? strtok(rest + 1, " ") : NULL;
     char *ids_s = tok, *str_s = tok ? strtok(NULL, " \r\n") : NULL;
     int ok = ids_s && str_s;
-    for (int i = 0; ok && i < n; i++) {
-        ids[i] = strtol(ids_s, &ids_s, 10); if (*ids_s == ',') ids_s++;
-        stress[i] = strtol(str_s, &str_s, 10); if (*str_s == ',') str_s++;
-        ok = ids[i] >= 0 && ids[i] < 76 && stress[i] >= 0 && stress[i] < 3;
+    for (int i = 0; ok && i < n; i++) {     // exactly n comma-separated values in each list
+        char *a = ids_s, *b = str_s;
+        ids[i] = strtol(a, &ids_s, 10);
+        stress[i] = strtol(b, &str_s, 10);
+        ok = ids_s != a && str_s != b && ids[i] >= 0 && ids[i] < TV_VOCAB && stress[i] >= 0 && stress[i] < TV_STRESS;
+        if (ok && i < n - 1) { ok = *ids_s == ',' && *str_s == ','; ids_s++; str_s++; }
     }
+    if (ok) ok = !*ids_s && !*str_s;
     if (!ok) { printf("ERR bad tokens\n"); tv_free(ids); tv_free(stress); return; }
-    tv_options opt = {.speed = 1.0f, .seed = seed};
+    tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(0, 1)};
     tv_result r;
     tv_profile_reset();
     int64_t t0 = esp_timer_get_time();
@@ -149,25 +180,6 @@ static void run_syn(char *line) {
     dump_base64("pcm", pcm, (size_t)r.n_samples * 2, 1, r.n_samples);
     tv_free(pcm); tv_free(r.audio); tv_free(r.durations);
     printf("DONE\n");
-}
-
-// The acoustic stack is streamed into the vocoder: a frame sees 32 frames ahead and 512 back, so
-// sound starts early and its memory stays fixed. "look 0" switches to full attention (the
-// reference numerics; sound starts only once the whole acoustic stack is done).
-static int acoustic_lookahead = 32;
-#define ACOUSTIC_PAST 512
-
-// Frames that fit in the free PSRAM. Streaming with a past window: ~2.7 MB fixed (key and value
-// rings, the token states) plus ~1.3 KB per frame, measured; full attention: ~2.9 KB per frame.
-// The largest single buffer is T x 768 bytes. The model itself handles at most 3000 frames.
-static int frame_budget(void) {
-    long fixed = acoustic_lookahead > 0 ? 3000 * 1024 : 1200 * 1024, bytes_per_frame = acoustic_lookahead > 0 ? 1300 : 2900;
-    long total = (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - fixed;
-    long largest = (long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) - 64 * 1024;
-    long frames = total / bytes_per_frame;
-    if (largest / 800 < frames) frames = largest / 800;
-    if (frames > 3000) frames = 3000;
-    return frames > 0 ? (int)frames : 0;
 }
 
 // Streams synthesized audio to the speaker in 0.2 s chunks (clipped at +-0.99).
@@ -243,20 +255,22 @@ static void mmbench(void) {
     heap_caps_free(w_ps);
 }
 
+static int32_t tok_ids[MAX_TOKENS], tok_stress[MAX_TOKENS];     // phonemizer output (say_piece, PHON)
+
 // One piece of text: phonemize, synthesize, queue for playback. Splits at clauses when too long.
 static int say_piece(char *text, int voice, unsigned seed, int depth) {
-    static int32_t ids[512], stress[512];
-    int n = tvp_phonemize(text, ids, stress, 512);
+    int32_t *ids = tok_ids, *stress = tok_stress;
+    int n = tvp_phonemize(text, ids, stress, MAX_TOKENS);
     if (n == -2 || n > 0) {
         // Streaming a longer utterance, the acoustic stack still has work to do while the first audio
         // plays: collect 0.4 s before playback starts so the next chunk is ready in time. Up to
-        // ~250 frames (~40 phonemes) that was never needed.
+        // ~250 frames (~30 phonemes) that was never needed.
         stream_state st = {.preroll = acoustic_lookahead > 0 && n > 30 ? 2 * STREAM_CHUNK : STREAM_CHUNK};
         board_show_text(text);
         tv_profile_reset();
-        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(), .on_audio = on_audio, .audio_user = &st,
-                          .acoustic_lookahead = acoustic_lookahead, .acoustic_past = ACOUSTIC_PAST};
-        tv_result r;
+        tv_options opt = {.speed = 1.0f, .seed = seed, .max_frames = frame_budget(acoustic_lookahead, 0), .on_audio = on_audio,
+                          .audio_user = &st, .acoustic_lookahead = acoustic_lookahead, .acoustic_past = ACOUSTIC_PAST};
+        tv_result r = {0};
         int64_t t0 = esp_timer_get_time();
         int rc = n > 0 ? tv_synthesize(&model, ids, stress, n, voice, &opt, &r) : TV_TOO_LONG;
         if (rc == 0) {
@@ -279,7 +293,8 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
                 return 0;
             }
         }
-        printf("  too long for memory (%d frames, budget %d): %s\n", r.n_frames, opt.max_frames, text);
+        if (n < 0) printf("  cannot phonemize: %s (%s)\n", tvp_error(), text);
+        else printf("  too long for memory (%d frames, budget %d): %s\n", r.n_frames, opt.max_frames, text);
         return -1;
     }
     printf("  cannot phonemize: %s (%s)\n", tvp_error(), text);
@@ -288,12 +303,11 @@ static int say_piece(char *text, int voice, unsigned seed, int depth) {
 
 static int voice_id = 1;      // M2
 
+// line (split in place) must have room for one more byte (tv_finish_text).
 static void say(char *line) {
-    static char buf[2048];
-    snprintf(buf, sizeof buf - 2, "%s", line);
-    tv_finish_text(buf);
+    tv_finish_text(line);
     char *parts[64];
-    int k = tv_split_sentences(buf, parts, 64);
+    int k = tv_split_sentences(line, parts, 64);
     for (int i = 0; i < k; i++) say_piece(parts[i], voice_id, (unsigned)i, 0);
 }
 
@@ -304,7 +318,7 @@ static int read_line(char *buf, int size) {
     int n = 0;
     for (;;) {
         int c = fgetc(stdin);
-        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (c == EOF) { clearerr(stdin); vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         int last = prev;
         prev = c;
         if (c == '\n' && last == '\r') continue;    // second half of a CRLF
@@ -317,7 +331,8 @@ static int read_line(char *buf, int size) {
             if (n) { n--; fputs("\b \b", stdout); fflush(stdout); }
             continue;
         }
-        if (n < size - 1 && (c >= 0x20 || c >= 0x80)) {
+        if (c == '\t') c = ' ';
+        if (n < size - 1 && c >= 0x20) {
             buf[n++] = (char)c;
             putchar(c); fflush(stdout);
         }
@@ -340,18 +355,21 @@ static void run(void *arg) {
     printf("free PSRAM %u (largest block %u), internal %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     have_test = tdata && !tv_file_open(&test, tdata, tsize);
-    printf("\nType a phrase and press Enter. Commands: voice F2|M2, vol N, beep, TEST\n");
+    printf("\nType a phrase and press Enter. Commands: voice F2|M2, vol N, beep, look N, prof, TEST\n");
     static char line[8192];
     for (;;) {
         printf("READY\ntts> ");
         fflush(stdout);
-        if (!read_line(line, sizeof line)) continue;
+        if (!read_line(line, sizeof line - 1)) continue;        // one byte left for say()
         if (!strncmp(line, "SYN ", 4)) run_syn(line);
         else if (!strcmp(line, "TEST")) run_test();
         else if (!strcmp(line, "beep")) board_beep(880, 300);
         else if (!strcmp(line, "mmbench")) mmbench();
         else if (!strcmp(line, "prof")) { profiling = !profiling; printf("profiling %s\n", profiling ? "on" : "off"); }
-        else if (!strncmp(line, "voice ", 6)) { voice_id = !strcmp(line + 6, "F2") ? 0 : 1; printf("voice %s\n", voice_id ? "M2" : "F2"); }
+        else if (!strncmp(line, "voice ", 6)) {
+            if (!strcmp(line + 6, "F2") || !strcmp(line + 6, "M2")) voice_id = line[6] == 'M';
+            printf("voice %s\n", voice_id ? "M2" : "F2");
+        }
         else if (!strncmp(line, "look ", 5)) {     // the memory budget assumes a small look-ahead
             int v = atoi(line + 5);
             acoustic_lookahead = v < 0 ? 0 : v > 64 ? 64 : v;
@@ -362,11 +380,11 @@ static void run(void *arg) {
             printf(board_set_volume(v) ? "volume: codec not available\n" : "volume %d%%\n", v < 0 ? 0 : v > 100 ? 100 : v);
         }
         else if (!strncmp(line, "PHON ", 5)) {     // debugging: phonemes only
-            static int32_t ids[512], st[512];
             int64_t tp = esp_timer_get_time();
-            int n = tvp_phonemize(line + 5, ids, st, 512);
+            int n = tvp_phonemize(line + 5, tok_ids, tok_stress, MAX_TOKENS);
             printf("PHON %d in %.1f ms:", n, (esp_timer_get_time() - tp) / 1000.0);
-            for (int i = 0; i < n; i++) printf(" %d", (int)ids[i]);
+            for (int i = 0; i < n; i++) printf(" %d", (int)tok_ids[i]);
+            if (n < 0) printf(" %s", tvp_error());
             printf("\n");
         }
         else say(line);

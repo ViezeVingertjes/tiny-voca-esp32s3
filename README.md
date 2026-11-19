@@ -10,8 +10,8 @@ No cloud, no computer once it is flashed.
 
 | Board | `BOARD` | Status |
 |---|---|---|
-| [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) | `waveshare_s3_audio` | Works |
-| [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm) | `waveshare_s3_amoled_216` | Works |
+| [Waveshare ESP32-S3-AUDIO-Board](https://www.waveshare.com/wiki/ESP32-S3-AUDIO-Board) | `waveshare_s3_audio` | Works, prebuilt firmware |
+| [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm) | `waveshare_s3_amoled_216` | Works; build the firmware yourself (below), the screen is not used yet |
 
 ## Quick start
 
@@ -23,7 +23,7 @@ pip install esptool huggingface_hub pyserial
 git clone https://github.com/ngxson/tiny-voca-esp32s3 && cd tiny-voca-esp32s3
 hf download ngxson/tiny-voca-esp32s3 --local-dir out
 esptool write-flash 0x0 out/waveshare_s3_audio/firmware.bin 0x210000 out/tvoca.bin 0x910000 out/phonemizer.bin
-./monitor.sh
+./monitor.sh                # finds the board on /dev/ttyACM* (Linux) or /dev/cu.usbmodem* (macOS)
 ```
 
 ```
@@ -40,6 +40,7 @@ tts> Hello! This is tiny voca, speaking from the little board on your desk.
 | `beep` | Test the speaker |
 | `prof` | Print where the time goes after each sentence |
 | `look 0` / `look 32` | Full attention (speech starts later) / streaming, the default |
+| `TEST` | Run the test vector (developers, see [AGENTS.md](AGENTS.md)) |
 
 A short sentence starts playing after about a second, a long one after a few seconds. One sentence
 can be up to about 19 seconds long; longer ones are split at commas.
@@ -52,8 +53,12 @@ files in `out/` stay as they are):
 ```bash
 cd firmware
 . $IDF_PATH/export.sh
-idf.py -B build/waveshare_s3_audio -DBOARD=waveshare_s3_audio build flash
+idf.py -B build/waveshare_s3_audio -DBOARD=waveshare_s3_audio build flash     # or the BOARD of yours
 ```
+
+`flash` writes the bootloader, partition table and app; the model and phonemizer data stay in flash.
+With a board that has no prebuilt firmware, flash `out/tvoca.bin` (0x210000) and `out/phonemizer.bin`
+(0x910000) with esptool once, as in the Quick start.
 
 Technical details, including how to export the model yourself, are in [AGENTS.md](AGENTS.md).
 

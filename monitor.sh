@@ -2,7 +2,7 @@
 # Print the ESP32 serial log and send stdin to the board (Ctrl+C to quit).
 # Usage: ./monitor.sh [-r] [port]
 #   -r    reset the board first, to get the boot log
-#   port  defaults to the first /dev/cu.usbmodem*
+#   port  defaults to the first /dev/ttyACM* (Linux) or /dev/cu.usbmodem* (macOS)
 # Typed keys go to the board as they are pressed (the board echoes them and handles
 # backspace); piped input is forwarded too: echo "Hello there." | ./monitor.sh
 set -euo pipefail
@@ -14,9 +14,9 @@ if [ "${1:-}" = "-r" ]; then
     shift
 fi
 
-PORT="${1:-$(ls /dev/cu.usbmodem* 2>/dev/null | head -n1 || true)}"
+PORT="${1:-$(ls /dev/ttyACM* /dev/cu.usbmodem* 2>/dev/null | head -n1 || true)}"
 if [ -z "$PORT" ]; then
-    echo "No /dev/cu.usbmodem* found - is the board plugged in?" >&2
+    echo "No /dev/ttyACM* or /dev/cu.usbmodem* found - is the board plugged in?" >&2
     exit 1
 fi
 
@@ -46,10 +46,13 @@ def on_signal(*_):
 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(sig, on_signal)
 try:
-    # exclusive: a second monitor/keymap/flash must fail loudly, not share the port
-    s = serial.Serial(port, 115200, timeout=0.2, exclusive=True)
+    # exclusive: a second monitor or a flash must fail loudly, not share the port
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout, s.exclusive = port, 115200, 0.2, True
+    s.rts = False  # only RTS: DTR low with RTS high resets the S3 (see tools/tvserial.py)
+    s.open()
 except serial.SerialException as e:
-    print(f"Cannot open {port}: {e}\nIs another monitor.sh / keymap.sh / idf.py using it?", file=sys.stderr)
+    print(f"Cannot open {port}: {e}\nIs another monitor.sh or idf.py using it?", file=sys.stderr)
     sys.exit(1)
 if reset:
     s.dtr = False; s.rts = True; time.sleep(0.1); s.rts = False

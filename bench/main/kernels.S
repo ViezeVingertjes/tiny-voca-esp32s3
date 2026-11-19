@@ -1,92 +1,8 @@
-// int8 matmul kernels for the ESP32-S3 PIE (128-bit SIMD).
-// Every vector pointer must be 16-byte aligned. Kernels read 16 bytes past
-// the end of their inputs (software pipelining), so buffers need 16 bytes of slack.
+// Experimental int8 kernels for the ESP32-S3 PIE (128-bit SIMD), the ancestors of
+// engine/kernels_s3.S. Every vector pointer must be 16-byte aligned. Kernels read up
+// to 48 bytes past the end of their inputs (software pipelining), so buffers carry slack.
 
     .text
-
-// int32 dot_rows_s8_accx(const int8_t *x, const int8_t *W, int32_t *out, int N, int k16)
-// out[n] = dot(x[0:K], W[n*K : n*K+K]) for n < N, K = 16*k16. Uses the 40-bit ACCX.
-    .align 4
-    .global dot_rows_s8_accx
-    .type dot_rows_s8_accx, @function
-dot_rows_s8_accx:
-    entry a1, 32
-    mov a8, a2
-.Lrows_n:
-    mov a2, a8
-    ee.zero.accx
-    ee.vld.128.ip q0, a2, 16
-    loopnez a6, .Lrows_k
-    ee.vld.128.ip q1, a3, 16
-    ee.vmulas.s8.accx.ld.ip q0, a2, 16, q0, q1
-.Lrows_k:
-    rur.accx_0 a9
-    s32i a9, a4, 0
-    addi a4, a4, 4
-    addi a5, a5, -1
-    bnez a5, .Lrows_n
-    retw
-
-// void dot_cols_s8_accx(const int8_t *X, const int8_t *w, int32_t *out, int T, int k16, int out_stride_bytes)
-// One weight row against T activation rows (X rows contiguous, K bytes each):
-// out[t * stride] = dot(X[t], w). The weight row stays in cache while t runs.
-    .align 4
-    .global dot_cols_s8_accx
-    .type dot_cols_s8_accx, @function
-dot_cols_s8_accx:
-    entry a1, 32
-    mov a8, a3
-.Lcols_t:
-    mov a3, a8
-    ee.zero.accx
-    ee.vld.128.ip q0, a2, 16
-    loopnez a6, .Lcols_k
-    ee.vld.128.ip q1, a3, 16
-    ee.vmulas.s8.accx.ld.ip q0, a2, 16, q0, q1
-.Lcols_k:
-    addi a2, a2, -16
-    rur.accx_0 a9
-    s32i a9, a4, 0
-    add a4, a4, a7
-    addi a5, a5, -1
-    bnez a5, .Lcols_t
-    retw
-
-// void qacc_block_s8(const int8_t *x, const int8_t *wblk, uint8_t *qacc_out, int k16)
-// 16 outputs at once: QACC[j] += sum_k wblk[k*16 + j] * x[k]. wblk is a [K][16]
-// tile (16 output channels interleaved). QACC lanes are 20-bit; the raw
-// accumulator is stored as 4 x 16 bytes: QACC_L low128, QACC_L high32, QACC_H low128, QACC_H high32.
-    .align 4
-    .global qacc_block_s8
-    .type qacc_block_s8, @function
-qacc_block_s8:
-    entry a1, 32
-    ee.zero.qacc
-    ee.vld.128.ip q1, a3, 16
-    loopnez a5, .Lqacc_k
-    ee.vld.128.ip q0, a2, 16
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 0
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 1
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 2
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 3
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 4
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 5
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 6
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 7
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 8
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 9
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 10
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 11
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 12
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 13
-    ee.vsmulas.s8.qacc.ld.incp q2, a3, q1, q0, 14
-    ee.vsmulas.s8.qacc.ld.incp q1, a3, q2, q0, 15
-.Lqacc_k:
-    ee.st.qacc_l.l.128.ip a4, 16
-    ee.st.qacc_l.h.32.ip a4, 16
-    ee.st.qacc_h.l.128.ip a4, 16
-    ee.st.qacc_h.h.32.ip a4, 16
-    retw
 
 // void read_vld(const void *p, int n16): stream n16 x 16 bytes through q0 (bandwidth test).
     .align 4
@@ -100,7 +16,10 @@ read_vld:
     retw
 
 // void qacc_block_s8_v2(const int8_t *x, const int8_t *wblk, uint8_t *qacc_out, int k32)
-// Same result as qacc_block_s8, K = 32*k32. Weights are loaded 3 instructions
+// 16 outputs at once: QACC[j] += sum_k wblk[k*16 + j] * x[k] for K = 32*k32. wblk is a [K][16]
+// tile (16 output channels interleaved). QACC lanes are 20-bit; the raw accumulator is stored
+// as 4 x 16 bytes: QACC_L low128, QACC_L high32, QACC_H low128, QACC_H high32 (the loop of
+// qacc_mm_s8 in the firmware, which also loads QACC first). Weights are loaded 3 instructions
 // before use (q1..q4 rotate) and the next 16 inputs are loaded one chunk ahead
 // (q0/q5 alternate), so no instruction waits on a load. Over-reads 48 bytes of
 // weights and 16 bytes of inputs.

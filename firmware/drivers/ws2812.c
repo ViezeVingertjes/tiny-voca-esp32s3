@@ -24,6 +24,8 @@ ws2812 *ws2812_new(int gpio, int count) {
                                      .flags.msb_first = 1};
     if (!s->pixels || !s->sending || rmt_new_tx_channel(&tc, &s->channel) || rmt_new_bytes_encoder(&ec, &s->encoder) ||
         rmt_enable(s->channel)) {
+        if (s->encoder) rmt_del_encoder(s->encoder);
+        if (s->channel) rmt_del_channel(s->channel);
         free(s->pixels); free(s->sending); free(s);
         return NULL;
     }
@@ -39,7 +41,7 @@ void ws2812_set(ws2812 *s, int i, uint8_t r, uint8_t g, uint8_t b) {
 
 void ws2812_show(ws2812 *s) {
     if (!s) return;
-    rmt_tx_wait_all_done(s->channel, 20);               // the previous frame, and the >50 us reset gap
+    rmt_tx_wait_all_done(s->channel, 20);               // the previous frame (callers leave the >50 us reset gap)
     memcpy(s->sending, s->pixels, (size_t)s->count * 3);
     rmt_transmit_config_t cfg = {.loop_count = 0};
     rmt_transmit(s->channel, s->encoder, s->sending, (size_t)s->count * 3, &cfg);

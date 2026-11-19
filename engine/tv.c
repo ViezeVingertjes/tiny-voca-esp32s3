@@ -1,11 +1,16 @@
 // tiny-voca engine: model loading and the forward pass. Numerics follow
-// esp32/tools/tvq.py (the golden model); see that file for the specification.
+// tools/tvq.py (the golden model); see that file for the specification.
 #include "tv.h"
 #include "tv_kernels.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_SQRT1_2
+#define M_SQRT1_2 0.70710678118654752440
+#endif
 
 #define GELU_MIN (-0.16997124f)
 #define VOCAB_UNK 4
@@ -13,18 +18,22 @@
 #define FIRST_VOWEL 43
 
 // ---------------------------------------------------------------- container
+_Static_assert(sizeof(tv_entry) == 96, "TVQ1 entries are 96 bytes");
+
 int tv_file_open(tv_file *f, const void *data, size_t size) {
     const uint8_t *p = data;
     if (size < 16 || memcmp(p, "TVQ1", 4)) return -1;
     uint32_t version, count;
     memcpy(&version, p + 4, 4);
     memcpy(&count, p + 8, 4);
-    if (version != 1 || 16 + (size_t)count * sizeof(tv_entry) > size) return -1;
+    if (version != 1 || count > (size - 16) / sizeof(tv_entry)) return -1;
     f->base = p;
     f->entries = (const tv_entry *)(p + 16);
     f->count = count;
-    for (uint32_t i = 0; i < count; i++)
-        if ((size_t)f->entries[i].offset + f->entries[i].nbytes > size) return -1;
+    for (uint32_t i = 0; i < count; i++) {     // the kernels need 16-byte aligned tensors
+        const tv_entry *e = &f->entries[i];
+        if (e->offset % 16 || e->offset > size || e->nbytes > size - e->offset) return -1;
+    }
     return 0;
 }
 
@@ -47,58 +56,58 @@ typedef struct {
     int failed;
 } loader;
 
-static const void *get(loader *L, const char *name, uint32_t dtype, uint32_t nelem) {
+static void fail(loader *L, const char *fmt, const char *what) {
+    if (L->failed) return;
+    snprintf(L->m->error, sizeof L->m->error, fmt, what);
+    L->failed = 1;
+}
+
+// The tensor named by fmt, ...; a missing or malformed one fails the load.
+static const void *get(loader *L, uint32_t dtype, uint32_t nelem, const char *fmt, ...) {
+    char name[96];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(name, sizeof name, fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= (int)sizeof name) { fail(L, "tensor name too long (%s)", fmt); return NULL; }
     const void *p = tv_file_get(&L->m->file, name, dtype, nelem);
-    if (!p && !L->failed) {
-        snprintf(L->m->error, sizeof L->m->error, "missing or malformed tensor %s (%u elements)", name, (unsigned)nelem);
-        L->failed = 1;
-    }
+    if (!p) fail(L, "missing or malformed tensor %s", name);
     return p;
 }
 
-static const float *getf(loader *L, const char *fmt, const char *prefix, uint32_t nelem) {
-    char name[96];
-    snprintf(name, sizeof name, fmt, prefix);
-    return get(L, name, TV_F32, nelem);
-}
-
 static float scale_of(loader *L, const char *prefix, const char *point) {
-    char name[96];
-    snprintf(name, sizeof name, "%s.%s.max", prefix, point);
-    const float *v = get(L, name, TV_F32, 1);
+    const float *v = get(L, TV_F32, 1, "%s.%s.max", prefix, point);
     return v ? (float)((double)*v / 127.0) : 1.0f;
 }
 
-static void load_linear(loader *L, tv_linear *lin, const char *base, int N, int K, float in_scale, int chunks) {
-    char name[96];
+// The int8 linear `<prefix><part>` (part may be "").
+static void load_linear(loader *L, tv_linear *lin, const char *prefix, const char *part, int N, int K, float in_scale,
+                        int chunks) {
     int npad = (N + 15) / 16 * 16;
     lin->N = N, lin->K = K, lin->in_scale = in_scale, lin->chunks = 1, lin->pre = NULL;
-    snprintf(name, sizeof name, "%s.wq", base); lin->wq = get(L, name, TV_I8, npad * K);
-    snprintf(name, sizeof name, "%s.ws", base); lin->ws = get(L, name, TV_F32, N);
-    snprintf(name, sizeof name, "%s.b", base); lin->b = get(L, name, TV_F32, N);
+    lin->wq = get(L, TV_I8, npad * K, "%s%s.wq", prefix, part);
+    lin->ws = get(L, TV_F32, N, "%s%s.ws", prefix, part);
+    lin->b = get(L, TV_F32, N, "%s%s.b", prefix, part);
     if (chunks > 1) {
-        snprintf(name, sizeof name, "%s.pre", base);
-        lin->pre = get(L, name, TV_I32, chunks * N);
+        lin->pre = get(L, TV_I32, chunks * N, "%s%s.pre", prefix, part);
         lin->chunks = chunks;
     }
     lin->bias = calloc(N, sizeof(float));
-    if (lin->b) memcpy(lin->bias, lin->b, N * sizeof(float));
-    if (!L->failed && tv_linear_prepare(lin)) {
-        snprintf(L->m->error, sizeof L->m->error, "kernel preparation failed for %s", base);
-        L->failed = 1;
-    }
+    if (!lin->bias) fail(L, "out of memory loading %s", prefix);
+    if (L->failed) return;
+    memcpy(lin->bias, lin->b, N * sizeof(float));
+    if (tv_linear_prepare(lin)) fail(L, "kernel preparation failed for %s", prefix);
 }
 
 static float gelu(float x) { return 0.5f * x * (1.0f + erff(x * (float)M_SQRT1_2)); }
 
 static void load_block(loader *L, tv_block *b, const char *prefix) {
-    char base[96];
-    b->norm1_w = getf(L, "%s.norm1.weight", prefix, TV_C);
-    b->norm1_b = getf(L, "%s.norm1.bias", prefix, TV_C);
-    b->norm2_w = getf(L, "%s.norm2.weight", prefix, TV_C);
-    b->norm2_b = getf(L, "%s.norm2.bias", prefix, TV_C);
-    b->dw_w = getf(L, "%s.depthwise.weight", prefix, TV_C * TV_KERNEL);
-    b->dw_b = getf(L, "%s.depthwise.bias", prefix, TV_C);
+    b->norm1_w = get(L, TV_F32, TV_C, "%s.norm1.weight", prefix);
+    b->norm1_b = get(L, TV_F32, TV_C, "%s.norm1.bias", prefix);
+    b->norm2_w = get(L, TV_F32, TV_C, "%s.norm2.weight", prefix);
+    b->norm2_b = get(L, TV_F32, TV_C, "%s.norm2.bias", prefix);
+    b->dw_w = get(L, TV_F32, TV_C * TV_KERNEL, "%s.depthwise.weight", prefix);
+    b->dw_b = get(L, TV_F32, TV_C, "%s.depthwise.bias", prefix);
     b->s_ln1 = scale_of(L, prefix, "ln1");
     b->s_q = scale_of(L, prefix, "q");
     b->s_k = scale_of(L, prefix, "k");
@@ -106,16 +115,12 @@ static void load_block(loader *L, tv_block *b, const char *prefix) {
     b->s_attn = scale_of(L, prefix, "attn");
     b->s_dw = scale_of(L, prefix, "dw");
     b->s_pre = scale_of(L, prefix, "pre");
-    float gmax = scale_of(L, prefix, "gelu") * 127.0f;     // undo the /127: the stored max
-    char name[96];
-    snprintf(name, sizeof name, "%s.gelu.max", prefix);
-    const float *gm = tv_file_get(&L->m->file, name, TV_F32, 1);
-    if (gm) gmax = *gm;
-    b->s_gelu = (float)(((double)gmax - (double)GELU_MIN) / 255.0);
-    snprintf(base, sizeof base, "%s.attention.qkv", prefix); load_linear(L, &b->qkv, base, 3 * TV_C, TV_C, b->s_ln1, 1);
-    snprintf(base, sizeof base, "%s.attention.out", prefix); load_linear(L, &b->out, base, TV_C, TV_C, b->s_attn, 1);
-    snprintf(base, sizeof base, "%s.expand", prefix); load_linear(L, &b->expand, base, TV_FF, TV_C, b->s_dw, 1);
-    snprintf(base, sizeof base, "%s.project", prefix); load_linear(L, &b->project, base, TV_C, TV_FF, b->s_gelu, 2);
+    const float *gmax = get(L, TV_F32, 1, "%s.gelu.max", prefix);   // the asymmetric GELU codes span [GELU_MIN, max]
+    b->s_gelu = gmax ? (float)(((double)*gmax - (double)GELU_MIN) / 255.0) : 1.0f;
+    load_linear(L, &b->qkv, prefix, ".attention.qkv", 3 * TV_C, TV_C, b->s_ln1, 1);
+    load_linear(L, &b->out, prefix, ".attention.out", TV_C, TV_C, b->s_attn, 1);
+    load_linear(L, &b->expand, prefix, ".expand", TV_FF, TV_C, b->s_dw, 1);
+    load_linear(L, &b->project, prefix, ".project", TV_C, TV_FF, b->s_gelu, 2);
     if (L->failed) return;
     // GELU table: pre code c -> asymmetric gelu code, exactly as the golden model rounds.
     for (int c = -128; c <= 127; c++) {
@@ -127,7 +132,8 @@ static void load_block(loader *L, tv_block *b, const char *prefix) {
     // Attention weights depend only on the integer gap to the row's max dot product.
     double score_scale = (double)b->s_q * b->s_k / sqrt((double)TV_HEAD_DIM);
     b->softmax_n = (int)ceil(log(254.0) / score_scale) + 1;      // 127 * exp(-gap * s) < 0.5 beyond
-    b->softmax_lut = malloc(b->softmax_n + 1);
+    b->softmax_lut = malloc(b->softmax_n + 1);         // small and read in the attention loops: internal RAM
+    if (!b->softmax_lut) { fail(L, "out of memory loading %s", prefix); return; }
     double v = 127.0, step = exp(-score_scale);             // 127 * exp(-g * s) by repeated multiplication
     for (int g = 0; g < b->softmax_n; g++, v *= step) b->softmax_lut[g] = (uint8_t)lrint(v);
     b->softmax_lut[b->softmax_n] = 0;                       // gaps are clamped to softmax_n
@@ -142,15 +148,15 @@ static void load_block(loader *L, tv_block *b, const char *prefix) {
 }
 
 static void load_stack(loader *L, tv_stack *s, tv_block *storage, const char *name, int count) {
-    char prefix[96];
+    char prefix[64];
     s->blocks = storage;
     s->count = count;
     for (int i = 0; i < count; i++) {
         snprintf(prefix, sizeof prefix, "%s.blocks.%d", name, i);
         load_block(L, &storage[i], prefix);
     }
-    s->norm_w = getf(L, "%s.norm.weight", name, TV_C);
-    s->norm_b = getf(L, "%s.norm.bias", name, TV_C);
+    s->norm_w = get(L, TV_F32, TV_C, "%s.norm.weight", name);
+    s->norm_b = get(L, TV_F32, TV_C, "%s.norm.bias", name);
 }
 
 int tv_model_init(tv_model *m, const void *data, size_t size) {
@@ -161,37 +167,38 @@ int tv_model_init(tv_model *m, const void *data, size_t size) {
         return -1;
     }
     loader L = {m, 0};
-    m->tokens = get(&L, "tokens.weight", TV_F32, 76 * TV_C);
-    m->stress = get(&L, "stress.weight", TV_F32, 3 * TV_C);
-    m->voices = get(&L, "voices.weight", TV_F32, 2 * TV_C);
-    m->frame_voices = get(&L, "frame_voices.weight", TV_F32, 2 * TV_C);
-    load_stack(&L, &m->encoder, m->block_storage, "encoder", 4);
-    load_stack(&L, &m->prosody, m->block_storage + 4, "prosody_stack", 2);
-    load_stack(&L, &m->acoustic, m->block_storage + 6, "acoustic_stack", 5);
-    load_linear(&L, &m->dur1, "duration.conv1", TV_PRED, 3 * TV_C, scale_of(&L, "dur", "in"), 1);
-    load_linear(&L, &m->dur2, "duration.conv2", TV_PRED, 3 * TV_PRED, scale_of(&L, "dur", "h1"), 1);
-    m->dnorm1_w = get(&L, "duration.norm1.weight", TV_F32, TV_PRED);
-    m->dnorm1_b = get(&L, "duration.norm1.bias", TV_F32, TV_PRED);
-    m->dnorm2_w = get(&L, "duration.norm2.weight", TV_F32, TV_PRED);
-    m->dnorm2_b = get(&L, "duration.norm2.bias", TV_F32, TV_PRED);
-    m->dur_out_w = get(&L, "duration.out.weight", TV_F32, 2 * TV_PRED);
-    m->dur_out_b = get(&L, "duration.out.bias", TV_F32, 2);
-    m->frame_pos_w = get(&L, "frame_position.weight", TV_F32, TV_C * 3);
-    m->frame_pos_b = get(&L, "frame_position.bias", TV_F32, TV_C);
-    m->prosody_head_w = get(&L, "prosody_head.weight", TV_F32, 3 * TV_C);
-    m->prosody_head_b = get(&L, "prosody_head.bias", TV_F32, 3);
-    m->prosody_proj_w = get(&L, "prosody_projection.weight", TV_F32, TV_C * 3);
-    m->prosody_proj_b = get(&L, "prosody_projection.bias", TV_F32, TV_C);
+    m->tokens = get(&L, TV_F32, TV_VOCAB * TV_C, "tokens.weight");
+    m->stress = get(&L, TV_F32, TV_STRESS * TV_C, "stress.weight");
+    m->voices = get(&L, TV_F32, TV_VOICES * TV_C, "voices.weight");
+    m->frame_voices = get(&L, TV_F32, TV_VOICES * TV_C, "frame_voices.weight");
+    tv_block *blocks = m->block_storage;
+    load_stack(&L, &m->encoder, blocks, "encoder", TV_ENCODER_BLOCKS);
+    load_stack(&L, &m->prosody, blocks + TV_ENCODER_BLOCKS, "prosody_stack", TV_PROSODY_BLOCKS);
+    load_stack(&L, &m->acoustic, blocks + TV_ENCODER_BLOCKS + TV_PROSODY_BLOCKS, "acoustic_stack", TV_ACOUSTIC_BLOCKS);
+    load_linear(&L, &m->dur1, "duration.conv1", "", TV_PRED, 3 * TV_C, scale_of(&L, "dur", "in"), 1);
+    load_linear(&L, &m->dur2, "duration.conv2", "", TV_PRED, 3 * TV_PRED, scale_of(&L, "dur", "h1"), 1);
+    m->dnorm1_w = get(&L, TV_F32, TV_PRED, "duration.norm1.weight");
+    m->dnorm1_b = get(&L, TV_F32, TV_PRED, "duration.norm1.bias");
+    m->dnorm2_w = get(&L, TV_F32, TV_PRED, "duration.norm2.weight");
+    m->dnorm2_b = get(&L, TV_F32, TV_PRED, "duration.norm2.bias");
+    m->dur_out_w = get(&L, TV_F32, 2 * TV_PRED, "duration.out.weight");
+    m->dur_out_b = get(&L, TV_F32, 2, "duration.out.bias");
+    m->frame_pos_w = get(&L, TV_F32, TV_C * 3, "frame_position.weight");
+    m->frame_pos_b = get(&L, TV_F32, TV_C, "frame_position.bias");
+    m->prosody_head_w = get(&L, TV_F32, 3 * TV_C, "prosody_head.weight");
+    m->prosody_head_b = get(&L, TV_F32, 3, "prosody_head.bias");
+    m->prosody_proj_w = get(&L, TV_F32, TV_C * 3, "prosody_projection.weight");
+    m->prosody_proj_b = get(&L, TV_F32, TV_C, "prosody_projection.bias");
     m->s_voc = scale_of(&L, "voc", "in");
-    load_linear(&L, &m->harmonic, "vocoder.harmonic", 98, TV_C, m->s_voc, 1);
-    load_linear(&L, &m->noise, "vocoder.noise", 36, TV_C, m->s_voc, 1);
+    load_linear(&L, &m->harmonic, "vocoder.harmonic", "", TV_HARM_PARAMS, TV_C, m->s_voc, 1);
+    load_linear(&L, &m->noise, "vocoder.noise", "", TV_NOISE_PARAMS, TV_C, m->s_voc, 1);
     return L.failed ? -1 : 0;
 }
 
 static void free_linear(tv_linear *l) { tv_linear_release(l); free(l->bias); l->bias = NULL; }
 
 void tv_model_free(tv_model *m) {
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < TV_BLOCKS; i++) {
         tv_block *b = &m->block_storage[i];
         free_linear(&b->qkv); free_linear(&b->out); free_linear(&b->expand); free_linear(&b->project);
         free(b->softmax_lut); b->softmax_lut = NULL;
@@ -201,10 +208,8 @@ void tv_model_free(tv_model *m) {
 
 // ---------------------------------------------------------------- profiling
 uint64_t tv_prof[TV_P_COUNT];
-static const char *const prof_names[TV_P_COUNT] = {"matmul (int8)", "matmul epilogue", "attention pass 1 (cpu)",
-    "softmax", "attention pass 2 (cpu)",
-    "layernorm", "depthwise conv", "quantize", "gelu table", "rotary + q/k/v codes", "vocoder cepstrum", "vocoder stft filter",
-    "vocoder pulses"};
+static const char *const prof_names[TV_P_COUNT] = {"matmul (int8)", "attention pass 1", "attention pass 2",
+    "layernorm", "depthwise conv", "quantize", "gelu table", "rotary + q/k/v codes", "vocoder cepstrum", "vocoder stft filter"};
 void tv_profile_reset(void) { memset(tv_prof, 0, sizeof tv_prof); }
 void tv_profile_report(void) {
     uint64_t total = 0;
@@ -223,9 +228,6 @@ typedef struct {
 static void dbg(ctx *c, const char *name, int dtype, const void *data, int rows, int cols) {
     if (c->opt->debug) c->opt->debug(c->opt->debug_user, name, dtype, data, rows, cols);
 }
-
-#define xmalloc tv_alloc
-
 
 static void quantize(const float *x, int n, float scale, int8_t *q) {
     uint64_t t0 = tv_time_us();
@@ -252,17 +254,23 @@ static void linear_q8(ctx *c, const tv_linear *L, const int8_t *x, int T, int8_t
     TV_PROF(TV_P_MATMUL, c->saturations += tv_linear_run(L, x, T, out, &e));
 }
 
+// Mean and 1 / standard deviation of one LayerNorm row.
+static inline float norm_stats(const float *x, int C, float *mean_out) {
+    float mean = 0, var = 0;
+    for (int i = 0; i < C; i++) mean += x[i];
+    mean /= C;
+    for (int i = 0; i < C; i++) var += (x[i] - mean) * (x[i] - mean);
+    *mean_out = mean;
+    return 1.0f / sqrtf(var / C + 1e-5f);
+}
+
 // LayerNorm straight to int8 codes (same arithmetic as layer_norm followed by quantize).
 static void layer_norm_q8_rows(const float *x, int t_begin, int T, int C, const float *w, const float *b, float scale, int8_t *q) {
     const float qinv = 1.0f / scale;
     for (int t = t_begin; t < T; t++) {
         const float *xt = x + (size_t)t * C;
         int8_t *qt = q + (size_t)t * C;
-        float mean = 0, var = 0;
-        for (int i = 0; i < C; i++) mean += xt[i];
-        mean /= C;
-        for (int i = 0; i < C; i++) var += (xt[i] - mean) * (xt[i] - mean);
-        float inv = 1.0f / sqrtf(var / C + 1e-5f);
+        float mean, inv = norm_stats(xt, C, &mean);
         for (int i = 0; i < C; i++) {
             float y = (xt[i] - mean) * inv * w[i] + b[i];
             qt[i] = tv_quant(y, qinv);
@@ -270,15 +278,12 @@ static void layer_norm_q8_rows(const float *x, int t_begin, int T, int C, const 
     }
 }
 
+// y may alias x: each value is read before it is written.
 static void layer_norm_rows(const float *x, int t_begin, int T, int C, const float *w, const float *b, float *y) {
     for (int t = t_begin; t < T; t++) {
         const float *xt = x + (size_t)t * C;
         float *yt = y + (size_t)t * C;
-        float mean = 0, var = 0;
-        for (int i = 0; i < C; i++) mean += xt[i];
-        mean /= C;
-        for (int i = 0; i < C; i++) var += (xt[i] - mean) * (xt[i] - mean);
-        float inv = 1.0f / sqrtf(var / C + 1e-5f);
+        float mean, inv = norm_stats(xt, C, &mean);
         for (int i = 0; i < C; i++) yt[i] = (xt[i] - mean) * inv * w[i] + b[i];
     }
 }
@@ -297,17 +302,21 @@ static void windows3(const float *x, int T, int C, float *y) {
         }
 }
 
-// Rotary tables for positions t0 .. t0+rows-1.
-static void rotary_rows(int t0, int rows, float *cos_t, float *sin_t) {
+// Rotary tables for positions 0 .. T-1: cos [T][24], then sin [T][24].
+static float *rotary_table(int T) {
     const int half = TV_HEAD_DIM / 2;
+    float *cos_t = tv_alloc((size_t)T * TV_HEAD_DIM * sizeof(float)), *sin_t = cos_t + (size_t)T * half;
+    uint64_t t0 = tv_time_us();
     for (int i = 0; i < half; i++) {
         float inv = 1.0f / powf(10000.0f, (float)(2 * i) / (float)TV_HEAD_DIM);
-        for (int t = 0; t < rows; t++) {
-            float a = (float)(t0 + t) * inv;
+        for (int t = 0; t < T; t++) {
+            float a = (float)t * inv;
             cos_t[t * half + i] = cosf(a);
             sin_t[t * half + i] = sinf(a);
         }
     }
+    tv_prof[TV_P_ROPE] += tv_time_us() - t0;
+    return cos_t;
 }
 
 // ---------------------------------------------------------------- tiled transformer stack
@@ -317,19 +326,18 @@ static void rotary_rows(int t0, int rows, float *cos_t, float *sin_t) {
 #define TV_TILE 64
 #define TV_KCH 128                  // keys per chunk: 6 KB of keys and 6 KB of values stay in cache
 
-typedef struct {                    // a debug tensor assembled from tiles (debug runs only)
-    uint8_t *data;
-} dbg_buf;
-
-static void dbg_tile(ctx *c, dbg_buf *d, const char *name, int dtype, const void *tile, int row0, int rows, int cols, int T) {
+// An int8 debug tensor `<prefix>.<point>` [T][cols] assembled from tiles in *buf (debug runs only).
+static void dbg_tile(ctx *c, uint8_t **buf, const char *prefix, const char *point, const int8_t *tile, int row0, int rows,
+                     int cols, int T) {
     if (!c->opt->debug) return;
-    int es = dtype == TV_I8 ? 1 : 4;
-    if (!d->data) d->data = xmalloc((size_t)T * cols * es);
-    memcpy(d->data + (size_t)row0 * cols * es, tile, (size_t)rows * cols * es);
+    if (!*buf) *buf = tv_alloc((size_t)T * cols);
+    memcpy(*buf + (size_t)row0 * cols, tile, (size_t)rows * cols);
     if (row0 + rows == T) {
-        dbg(c, name, dtype, d->data, T, cols);
-        tv_free(d->data);
-        d->data = NULL;
+        char name[96];
+        snprintf(name, sizeof name, "%s.%s", prefix, point);
+        dbg(c, name, TV_I8, *buf, T, cols);
+        tv_free(*buf);
+        *buf = NULL;
     }
 }
 
@@ -346,37 +354,39 @@ typedef struct {
     int32_t *vacc[2];               // [TV_TILE][48] per core: weighted value sums of one head
     int32_t *cmax[2];               // [TV_TILE][nchunks] per core: max dot product per key chunk
     int8_t *w8[2];                  // [TV_TILE][TV_KCH] per core: attention weights of one key chunk
-    float *cos_t, *sin_t;           // [T][24] rotary tables (whole utterance)
+    const float *cos_t, *sin_t;     // [T][24] rotary tables (whole utterance)
+    float *own_rotary;              // the tables, when this scratch made them
     float *h, *qkv, *ln2;           // tile buffers (h: debug runs only)
     int8_t *i8, *g8;                // tile int8 buffers (matmul input / expand output)
-    dbg_buf d_ln1, d_attn, d_dw, d_pre, d_gelu;
+    uint8_t *d_ln1, *d_attn, *d_dw, *d_pre, *d_gelu;    // debug tensors being assembled
 } scratch;
 
 // Key/value storage per block: allocated separately when every block keeps its own.
 static size_t kv_rows(const scratch *s) { return (size_t)s->ring * TV_KCH; }
 static void kv_alloc(const scratch *s, int8_t **kh, int8_t **vt) {
     size_t vsize = (size_t)TV_HEADS * kv_rows(s) * TV_HEAD_DIM;
-    *kh = xmalloc(vsize);
-    *vt = xmalloc(vsize + 64);                                          // tv_attn_pv48 reads past a chunk
+    *kh = tv_alloc(vsize);
+    *vt = tv_alloc(vsize + 64);                                          // tv_attn_pv48 reads past a chunk
     memset(*vt, 0, vsize);                                              // keys past T stay 0
 }
 
-static void scratch_alloc(scratch *s, int T, int debug, int ring) {
+// rotary: tables from rotary_table(T), or NULL to make them here.
+static void scratch_alloc(scratch *s, int T, int debug, int ring, const float *rotary) {
     memset(s, 0, sizeof *s);
     s->T = T;
     s->nchunks = (T + TV_KCH - 1) / TV_KCH;
     s->ring = ring > 0 && ring < s->nchunks ? ring : s->nchunks;
-    s->q8 = xmalloc(kv_rows(s) * TV_C);
+    s->q8 = tv_alloc(kv_rows(s) * TV_C);
     kv_alloc(s, &s->kh, &s->vt);
-    for (int i = 0; i < 2; i++) s->vacc[i] = xmalloc((size_t)TV_TILE * TV_HEAD_DIM * sizeof(int32_t));
-    for (int i = 0; i < 2; i++) s->cmax[i] = xmalloc((size_t)TV_TILE * s->nchunks * sizeof(int32_t));
+    for (int i = 0; i < 2; i++) s->vacc[i] = tv_alloc((size_t)TV_TILE * TV_HEAD_DIM * sizeof(int32_t));
+    for (int i = 0; i < 2; i++) s->cmax[i] = tv_alloc((size_t)TV_TILE * s->nchunks * sizeof(int32_t));
     for (int i = 0; i < 2; i++) s->w8[i] = tv_alloc_fast((size_t)TV_TILE * TV_KCH);
-    if (debug) s->h = xmalloc((size_t)TV_TILE * TV_FF * sizeof(float));     // unfused expand only
-    s->qkv = xmalloc((size_t)TV_TILE * 3 * TV_C * sizeof(float));
-    s->ln2 = xmalloc((size_t)(TV_TILE + 6) * TV_C * sizeof(float));
-    s->cos_t = xmalloc((size_t)T * TV_HEAD_DIM / 2 * sizeof(float));
-    s->sin_t = xmalloc((size_t)T * TV_HEAD_DIM / 2 * sizeof(float));
-    TV_PROF(TV_P_ROPE, rotary_rows(0, T, s->cos_t, s->sin_t));
+    if (debug) s->h = tv_alloc((size_t)TV_TILE * TV_FF * sizeof(float));     // unfused expand only
+    s->qkv = tv_alloc((size_t)TV_TILE * 3 * TV_C * sizeof(float));
+    s->ln2 = tv_alloc((size_t)(TV_TILE + 6) * TV_C * sizeof(float));
+    if (!rotary) rotary = s->own_rotary = rotary_table(T);
+    s->cos_t = rotary;
+    s->sin_t = rotary + (size_t)T * TV_HEAD_DIM / 2;
     s->i8 = tv_alloc_fast((size_t)TV_TILE * TV_C);                     // matmul inputs
     s->g8 = tv_alloc_fast((size_t)TV_TILE * TV_FF);
 }
@@ -384,7 +394,7 @@ static void scratch_alloc(scratch *s, int T, int debug, int ring) {
 static void scratch_free(scratch *s) {
     tv_free(s->q8); tv_free(s->kh); tv_free(s->vt);
     for (int i = 0; i < 2; i++) { tv_free(s->vacc[i]); tv_free(s->cmax[i]); tv_free(s->w8[i]); }
-    tv_free(s->h); tv_free(s->qkv); tv_free(s->ln2); tv_free(s->cos_t); tv_free(s->sin_t);
+    tv_free(s->h); tv_free(s->qkv); tv_free(s->ln2); tv_free(s->own_rotary);
     tv_free(s->i8); tv_free(s->g8);
 }
 
@@ -404,7 +414,7 @@ static void dbg_qkv(ctx *c, const char *prefix, const scratch *s) {
     if (!c->opt->debug) return;
     const int T = s->T;
     char name[96];
-    int8_t *tmp = xmalloc((size_t)T * TV_C);
+    int8_t *tmp = tv_alloc((size_t)T * TV_C);
     for (int h = 0; h < TV_HEADS; h++)
         for (int t = 0; t < T; t++)
             memcpy(tmp + ((size_t)h * T + t) * TV_HEAD_DIM, q_row(s, t) + h * TV_HEAD_DIM, TV_HEAD_DIM);
@@ -420,15 +430,15 @@ static void dbg_qkv(ctx *c, const char *prefix, const scratch *s) {
     tv_free(tmp);
 }
 
-// Attention for queries [q0, q0+qn) and heads [h0, h1), writing y rows (q - t0). Two passes over
+// Attention for queries [q0, q0+qn) and heads [h0, h1), writing tile rows q - q0. Two passes over
 // key chunks, so no score matrix is stored: pass 1 finds each query's max dot product, pass 2
 // recomputes the dots, turns them into int8 weights and accumulates weights . values per chunk.
 // Integer sums, so the result equals the one-pass computation exactly.
 typedef struct {
     const tv_block *b;
     scratch *s;
-    int q0, qn, t0, h0, h1, set;
-    uint64_t t_qk, t_soft, t_pv;    // time per phase on this job's core
+    int q0, qn, h0, h1, set;        // queries [q0, q0+qn) are rows [0, qn) of the tile
+    uint64_t t_qk, t_pv;            // time per pass on this job's core
 } attn_job;
 
 // Keys [k0 + *lo, k0 + hi) of the chunk [k0, k0 + kn) that query position q may see; returns hi.
@@ -490,7 +500,7 @@ static void attn_run(void *arg) {
         const float inv_attn = 1.0f / b->s_attn;
         for (int r = 0; r < j->qn; r++) {           // attention output, straight to the int8 codes of `out`
             const int32_t *ar = acc + (size_t)r * TV_HEAD_DIM;
-            int8_t *yr = s->i8 + (size_t)(j->q0 - j->t0 + r) * TV_C + h * TV_HEAD_DIM;
+            int8_t *yr = s->i8 + (size_t)r * TV_C + h * TV_HEAD_DIM;
             for (int d = 0; d < TV_HEAD_DIM; d++) yr[d] = tv_quant((float)ar[d] * (b->s_v / (float)sum[r]), inv_attn);
         }
         j->t_qk += t1 - t0; j->t_pv += tv_time_us() - t1;
@@ -600,9 +610,9 @@ typedef struct {
 // Advances block b over the residual x so that rows [0, target) are final, given that its input
 // rows [0, avail) are final. Rows are independent of how they are grouped into tiles, so any
 // sequence of calls gives the same result as one call with target = avail = T.
+// prefix names the block's debug tensors.
 static void block_advance(ctx *c, const tv_block *b, const char *prefix, float *x, int T, scratch *s,
                           block_pos *pos, int avail, int target) {
-    char name[96];
     const int L = s->lookahead;
     // ---- pass 1: queries, keys and values of the input rows that are final (with a look-ahead, only
     // as far as the queries below need: in a ring, keys written early would replace ones still seen)
@@ -610,7 +620,7 @@ static void block_advance(ctx *c, const tv_block *b, const char *prefix, float *
     while (pos->p1 < n1) {
         int t0 = pos->p1, rows = n1 - t0 < TV_TILE ? n1 - t0 : TV_TILE;
         tile_parallel(TV_P_NORM, TILE_LN1, rows, b, s, x + (size_t)t0 * TV_C, t0, T);
-        snprintf(name, sizeof name, "%s.ln1", prefix); dbg_tile(c, &s->d_ln1, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        dbg_tile(c, &s->d_ln1, prefix, "ln1", s->i8, t0, rows, TV_C, T);
         linear_f(c, &b->qkv, s->i8, rows, s->qkv);
         tile_parallel(TV_P_ROPE, TILE_QKV, rows, b, s, NULL, t0, T);
         pos->p1 += rows;
@@ -623,11 +633,12 @@ static void block_advance(ctx *c, const tv_block *b, const char *prefix, float *
         int t0 = pos->p2, rows = n2 - t0 < TV_TILE ? n2 - t0 : TV_TILE;
         int oldest = s->past > 0 && t0 > s->past ? t0 - s->past : 0;        // the oldest key these queries see
         if ((pos->p1 - 1) / TV_KCH - oldest / TV_KCH >= s->ring) { fprintf(stderr, "tv: key ring too small\n"); abort(); }
-        attn_job ja = {b, s, t0, rows, t0, 0, TV_HEADS / 2, 0, 0, 0, 0}, jb = {b, s, t0, rows, t0, TV_HEADS / 2, TV_HEADS, 1, 0, 0, 0};
+        attn_job ja = {.b = b, .s = s, .q0 = t0, .qn = rows, .h0 = 0, .h1 = TV_HEADS / 2, .set = 0};
+        attn_job jb = {.b = b, .s = s, .q0 = t0, .qn = rows, .h0 = TV_HEADS / 2, .h1 = TV_HEADS, .set = 1};
         tv_parallel2(attn_run, &ja, &jb);
         tv_prof[TV_P_ATTN_DOT] += ja.t_qk + jb.t_qk;     // pass 1
         tv_prof[TV_P_ATTN_PV] += ja.t_pv + jb.t_pv;      // pass 2: dots again, weights, weights . values, codes
-        snprintf(name, sizeof name, "%s.attn", prefix); dbg_tile(c, &s->d_attn, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        dbg_tile(c, &s->d_attn, prefix, "attn", s->i8, t0, rows, TV_C, T);
         linear_add(c, &b->out, s->i8, rows, x + (size_t)t0 * TV_C);
         pos->p2 += rows;
     }
@@ -642,27 +653,28 @@ static void block_advance(ctx *c, const tv_block *b, const char *prefix, float *
         tile_parallel(TV_P_NORM, TILE_LN2, last - t0, b, s, x + (size_t)t0 * TV_C, t0, T);
         if (t0 + rows < T) memcpy(pos->carry, s->ln2 + (size_t)rows * TV_C, sizeof pos->carry);  // positions t0+rows-3 ..
         tile_parallel(TV_P_DW, TILE_DW, rows, b, s, NULL, t0, T);
-        snprintf(name, sizeof name, "%s.dw", prefix); dbg_tile(c, &s->d_dw, name, TV_I8, s->i8, t0, rows, TV_C, T);
+        dbg_tile(c, &s->d_dw, prefix, "dw", s->i8, t0, rows, TV_C, T);
         int8_t *g = s->g8;
         if (c->opt->debug) {        // unfused, so the pre-activation codes can be checked too
             linear_f(c, &b->expand, s->i8, rows, s->h);
             quantize(s->h, rows * TV_FF, b->s_pre, g);
-            snprintf(name, sizeof name, "%s.pre", prefix); dbg_tile(c, &s->d_pre, name, TV_I8, g, t0, rows, TV_FF, T);
+            dbg_tile(c, &s->d_pre, prefix, "pre", g, t0, rows, TV_FF, T);
             TV_PROF(TV_P_GELU, for (int i = 0; i < rows * TV_FF; i++) g[i] = b->gelu_lut[g[i] + 128]);
         } else {
             linear_q8(c, &b->expand, s->i8, rows, g, b->s_pre, b->gelu_lut);
         }
-        snprintf(name, sizeof name, "%s.gelu", prefix); dbg_tile(c, &s->d_gelu, name, TV_I8, g, t0, rows, TV_FF, T);
+        dbg_tile(c, &s->d_gelu, prefix, "gelu", g, t0, rows, TV_FF, T);
         linear_add(c, &b->project, g, rows, x + (size_t)t0 * TV_C);
         pos->p3 += rows;
     }
 }
 
 // x [T][C] is the residual input (overwritten); out receives the final LayerNorm (may alias x).
-// lookahead/past: the attention mask (0: full), see tv_options.acoustic_lookahead.
-static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x, int T, float *out, int lookahead, int past) {
+// lookahead/past: the attention mask (0: full), see tv_options.acoustic_lookahead. rotary: see scratch_alloc.
+static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x, int T, float *out, int lookahead, int past,
+                          const float *rotary) {
     scratch s;
-    scratch_alloc(&s, T, c->opt->debug != NULL, 0);
+    scratch_alloc(&s, T, c->opt->debug != NULL, 0, rotary);
     s.lookahead = lookahead;
     s.past = past;
     char buf[96];
@@ -679,25 +691,23 @@ static void stack_forward(ctx *c, const tv_stack *st, const char *name, float *x
     dbg(c, buf, TV_F32, out, T, TV_C);
 }
 
-static float gelu_f(float x) { return gelu(x); }
-
 static void predict_durations(ctx *c, const tv_model *m, const float *hidden, const int32_t *ids, int N, float speed,
                               int32_t *dur) {
-    float *win = xmalloc((size_t)N * 3 * TV_C * sizeof(float));
-    float *h1 = xmalloc((size_t)N * TV_PRED * sizeof(float)), *h2 = xmalloc((size_t)N * TV_PRED * sizeof(float));
-    int8_t *q = xmalloc((size_t)N * 3 * TV_C);
-    float *out = xmalloc((size_t)N * 2 * sizeof(float));
+    float *win = tv_alloc((size_t)N * 3 * TV_C * sizeof(float));
+    float *h1 = tv_alloc((size_t)N * TV_PRED * sizeof(float)), *h2 = tv_alloc((size_t)N * TV_PRED * sizeof(float));
+    int8_t *q = tv_alloc((size_t)N * 3 * TV_C);
+    float *out = tv_alloc((size_t)N * 2 * sizeof(float));
     windows3(hidden, N, TV_C, win);
     quantize(win, N * 3 * TV_C, m->dur1.in_scale, q);
     dbg(c, "dur.in", TV_I8, q, N, 3 * TV_C);
     linear_f(c, &m->dur1, q, N, h1);
-    for (int i = 0; i < N * TV_PRED; i++) h1[i] = gelu_f(h1[i]);
+    for (int i = 0; i < N * TV_PRED; i++) h1[i] = gelu(h1[i]);
     layer_norm(h1, N, TV_PRED, m->dnorm1_w, m->dnorm1_b, h2);
     windows3(h2, N, TV_PRED, win);
     quantize(win, N * 3 * TV_PRED, m->dur2.in_scale, q);
     dbg(c, "dur.h1", TV_I8, q, N, 3 * TV_PRED);
     linear_f(c, &m->dur2, q, N, h1);
-    for (int i = 0; i < N * TV_PRED; i++) h1[i] = gelu_f(h1[i]);
+    for (int i = 0; i < N * TV_PRED; i++) h1[i] = gelu(h1[i]);
     layer_norm(h1, N, TV_PRED, m->dnorm2_w, m->dnorm2_b, h2);
     const float limit = log1pf(400.0f);
     for (int t = 0; t < N; t++) {
@@ -737,9 +747,9 @@ static void vocoder_inputs(ctx *c, const tv_model *m, const float *ac, const flo
 
 long tv_vocode(const tv_model *m, const float *ac, const float *pros, int T, const tv_options *opt, float *audio) {
     ctx c = {opt, 0};
-    int8_t *q = xmalloc((size_t)T * TV_C);
-    float *harm = xmalloc((size_t)T * 98 * sizeof(float)), *nz = xmalloc((size_t)T * 36 * sizeof(float));
-    float *f0 = xmalloc((size_t)T * sizeof(float));
+    int8_t *q = tv_alloc((size_t)T * TV_C);
+    float *harm = tv_alloc((size_t)T * TV_HARM_PARAMS * sizeof(float)), *nz = tv_alloc((size_t)T * TV_NOISE_PARAMS * sizeof(float));
+    float *f0 = tv_alloc((size_t)T * sizeof(float));
     vocoder_inputs(&c, m, ac, pros, T, q, harm, nz, f0);
     dbg(&c, "voc.in", TV_I8, q, T, TV_C);
     int S = T * TV_HOP;
@@ -772,17 +782,17 @@ typedef struct {
     int8_t **kh, **vt;              // per block
     block_pos *pos;                 // per block
     int vring;                      // rows of harm, nz and f0 (a ring of VOC_RING, or T)
-    float *harm, *nz, *f0;          // vocoder inputs [vring][98], [vring][36], [vring]
+    float *harm, *nz, *f0;          // vocoder inputs [vring][TV_HARM_PARAMS], [vring][TV_NOISE_PARAMS], [vring]
     float *ac_t, *harm_t, *nz_t, *f0_t;     // one step (at most TV_TILE rows) before it goes into the rings
     int8_t *q_t;
     int done;                       // rows of the vocoder inputs that are final
+    char prefix[TV_ACOUSTIC_BLOCKS][40];    // debug names of the blocks
 } acoustic_stream;
 
 // Makes stack output rows [done, e) final (at most TV_TILE of them) and turns them into vocoder inputs.
 static void acoustic_step(acoustic_stream *a, int e) {
     const tv_stack *st = &a->m->acoustic;
     const int T = a->T, n = st->count;
-    char name[96];
     if (a->s.ring < a->s.nchunks) {     // block 0 writes queries up to here; no block may still need the old ones
         long newest = e + (long)(n - 1) * a->D + a->s.lookahead + TV_KERNEL / 2;
         int oldest = a->pos[n - 1].p2;
@@ -792,8 +802,7 @@ static void acoustic_step(acoustic_stream *a, int e) {
     for (int l = 0; l < n; l++) {
         long target = e + (long)(n - 1 - l) * a->D;
         a->s.kh = a->kh[l]; a->s.vt = a->vt[l];
-        snprintf(name, sizeof name, "acoustic_stack.blocks.%d", l);
-        block_advance(a->c, &st->blocks[l], name, a->x, T, &a->s, &a->pos[l], l ? a->pos[l - 1].p3 : T,
+        block_advance(a->c, &st->blocks[l], a->prefix[l], a->x, T, &a->s, &a->pos[l], l ? a->pos[l - 1].p3 : T,
                       target < T ? (int)target : T);
     }
     if (a->pos[n - 1].p3 < e) { fprintf(stderr, "tv: acoustic stream stalled at %d of %d\n", a->pos[n - 1].p3, e); abort(); }
@@ -803,8 +812,8 @@ static void acoustic_step(acoustic_stream *a, int e) {
     vocoder_inputs(a->c, a->m, a->ac_t, a->pros + (size_t)r0 * 3, rows, a->q_t, a->harm_t, a->nz_t, a->f0_t);
     for (int r = 0; r < rows; r++) {
         int slot = (r0 + r) % a->vring;
-        memcpy(a->harm + (size_t)slot * 98, a->harm_t + (size_t)r * 98, 98 * sizeof(float));
-        memcpy(a->nz + (size_t)slot * 36, a->nz_t + (size_t)r * 36, 36 * sizeof(float));
+        memcpy(a->harm + (size_t)slot * TV_HARM_PARAMS, a->harm_t + (size_t)r * TV_HARM_PARAMS, TV_HARM_PARAMS * sizeof(float));
+        memcpy(a->nz + (size_t)slot * TV_NOISE_PARAMS, a->nz_t + (size_t)r * TV_NOISE_PARAMS, TV_NOISE_PARAMS * sizeof(float));
         a->f0[slot] = a->f0_t[r];
     }
     a->done = e;
@@ -816,40 +825,43 @@ static void acoustic_advance(void *user, int frames) {
     // after the first rows (as few as the vocoder needs: sound starts sooner), whole tiles: faster matmuls
     int E = a->done && frames < a->done + TV_TILE ? a->done + TV_TILE : frames;
     if (E > a->T) E = a->T;
-    // the vocoder still reads frames from about frames - 48 on: they must not be overwritten
+    // the vocoder still reads frames from about frames - 48 on (a block of tv_dsp.c's VOC_BLOCK = 8192
+    // samples is 32 frames, plus its FFT windows and a margin): they must not be overwritten
     if (a->vring < a->T && E - (frames - 48) > a->vring) { fprintf(stderr, "tv: vocoder ring too small\n"); abort(); }
     while (a->done < E) acoustic_step(a, E - a->done > TV_TILE ? a->done + TV_TILE : E);
 }
 
 static void acoustic_stream_run(ctx *c, const tv_model *m, float *x, const float *pros, int T, int L, int P,
-                                const tv_options *opt, float *audio) {
+                                const float *rotary, float *audio) {
+    const tv_options *opt = c->opt;
     acoustic_stream a = {.c = c, .m = m, .T = T, .D = L ? L + TV_KERNEL / 2 : T, .x = x, .pros = pros};
     const int n = m->acoustic.count;
+    for (int l = 0; l < n; l++) snprintf(a.prefix[l], sizeof a.prefix[l], "acoustic_stack.blocks.%d", l);
     // Rows the rings must hold: a block's keys from its oldest query - P to its newest + L + 3 plus
     // one step, and the queries of all blocks at once (block 0 runs (n-1) * D rows ahead of the last).
     long keys = (long)P + L + TV_KERNEL / 2 + TV_TILE, queries = (long)(n - 1) * a.D + L + TV_KERNEL / 2 + 2 * TV_TILE;
     long rows = keys > queries ? keys : queries;
     int ring = P > 0 && rows < T ? (int)((rows + TV_KCH - 1) / TV_KCH) + 1 : 0;
-    scratch_alloc(&a.s, T, 0, ring);
+    scratch_alloc(&a.s, T, 0, ring, rotary);
     a.s.lookahead = L;
     a.s.past = P;
-    a.kh = xmalloc(n * sizeof *a.kh);
-    a.vt = xmalloc(n * sizeof *a.vt);
-    a.pos = xmalloc(n * sizeof *a.pos);
+    a.kh = tv_alloc(n * sizeof *a.kh);
+    a.vt = tv_alloc(n * sizeof *a.vt);
+    a.pos = tv_alloc(n * sizeof *a.pos);
     memset(a.pos, 0, n * sizeof *a.pos);
     for (int l = 0; l < n; l++) {         // without a look-ahead the blocks run one after the other: one set
         if (l && L) kv_alloc(&a.s, &a.kh[l], &a.vt[l]);
         else { a.kh[l] = a.s.kh; a.vt[l] = a.s.vt; }
     }
     a.vring = L && T > VOC_RING ? VOC_RING : T;
-    a.harm = xmalloc((size_t)a.vring * 98 * sizeof(float));
-    a.nz = xmalloc((size_t)a.vring * 36 * sizeof(float));
-    a.f0 = xmalloc((size_t)a.vring * sizeof(float));
-    a.ac_t = xmalloc((size_t)TV_TILE * TV_C * sizeof(float));
-    a.harm_t = xmalloc((size_t)TV_TILE * 98 * sizeof(float));
-    a.nz_t = xmalloc((size_t)TV_TILE * 36 * sizeof(float));
-    a.f0_t = xmalloc((size_t)TV_TILE * sizeof(float));
-    a.q_t = xmalloc((size_t)TV_TILE * TV_C);
+    a.harm = tv_alloc((size_t)a.vring * TV_HARM_PARAMS * sizeof(float));
+    a.nz = tv_alloc((size_t)a.vring * TV_NOISE_PARAMS * sizeof(float));
+    a.f0 = tv_alloc((size_t)a.vring * sizeof(float));
+    a.ac_t = tv_alloc((size_t)TV_TILE * TV_C * sizeof(float));
+    a.harm_t = tv_alloc((size_t)TV_TILE * TV_HARM_PARAMS * sizeof(float));
+    a.nz_t = tv_alloc((size_t)TV_TILE * TV_NOISE_PARAMS * sizeof(float));
+    a.f0_t = tv_alloc((size_t)TV_TILE * sizeof(float));
+    a.q_t = tv_alloc((size_t)TV_TILE * TV_C);
     float *cursor = audio;
     tv_vocoder_stream(a.harm, a.nz, a.f0, opt->noise, opt->seed, T, a.vring, opt->on_audio ? opt->on_audio : collect_audio,
                       opt->on_audio ? opt->audio_user : (void *)&cursor, acoustic_advance, &a);
@@ -865,29 +877,40 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
                   const tv_options *opt, tv_result *res) {
     ctx c = {opt, 0};
     memset(res, 0, sizeof *res);
-    if (N < 1 || voice < 0 || voice > 1) return -1;
-    // ---- text encoder
-    float *x = xmalloc((size_t)N * TV_C * sizeof(float)), *hidden = xmalloc((size_t)N * TV_C * sizeof(float));
+    if (N < 1 || voice < 0 || voice >= TV_VOICES) return TV_BAD_INPUT;
+    for (int t = 0; t < N; t++)
+        if (ids[t] < 0 || ids[t] >= TV_VOCAB || stress[t] < 0 || stress[t] >= TV_STRESS) return TV_BAD_INPUT;
+    // ---- text encoder (its final LayerNorm replaces x)
+    float *x = tv_alloc((size_t)N * TV_C * sizeof(float));
     for (int t = 0; t < N; t++)
         for (int i = 0; i < TV_C; i++)
             x[t * TV_C + i] = m->tokens[ids[t] * TV_C + i] + m->stress[stress[t] * TV_C + i] + m->voices[voice * TV_C + i];
-    stack_forward(&c, &m->encoder, "encoder", x, N, hidden, 0, 0);
+    stack_forward(&c, &m->encoder, "encoder", x, N, x, 0, 0, NULL);
+    const float *hidden = x;
     // ---- durations
-    int32_t *dur = xmalloc((size_t)N * sizeof(int32_t));
+    int32_t *dur = tv_alloc((size_t)N * sizeof(int32_t));
     predict_durations(&c, m, hidden, ids, N, opt->speed > 0 ? opt->speed : 1.0f, dur);
     if (opt->force_durations) memcpy(dur, opt->force_durations, N * sizeof(int32_t));
     dbg(&c, "durations", TV_I32, dur, 1, N);
-    int T = 0;
-    for (int t = 0; t < N; t++) T += dur[t];
-    if (T < 1) { tv_free(x); tv_free(hidden); tv_free(dur); return -2; }
-    if (opt->max_frames > 0 && T > opt->max_frames) {
-        res->n_frames = T;
-        tv_free(x); tv_free(hidden); tv_free(dur);
-        return TV_TOO_LONG;
+    long frames_total = 0;
+    int rc = 0;
+    for (int t = 0; t < N && !rc; t++) {
+        if (dur[t] < 0) rc = TV_BAD_INPUT;
+        frames_total += dur[t];
+        if (frames_total > INT32_MAX / TV_HOP) rc = TV_TOO_LONG;
+    }
+    const int T = rc ? 0 : (int)frames_total;
+    if (!rc && T < 1) rc = TV_NO_FRAMES;
+    if (!rc && opt->max_frames > 0 && T > opt->max_frames) rc = TV_TOO_LONG;
+    if (!rc && opt->noise && opt->noise_len < T * TV_HOP) rc = TV_BAD_INPUT;
+    if (rc) {
+        if (rc == TV_TOO_LONG) res->n_frames = frames_total > INT32_MAX ? INT32_MAX : (int)frames_total;
+        tv_free(x); tv_free(dur);
+        return rc;
     }
     // ---- repeat token states by duration, add position-in-token and voice
-    float *frames = xmalloc((size_t)T * TV_C * sizeof(float));
-    uint8_t *vowel = xmalloc(T);
+    float *frames = tv_alloc((size_t)T * TV_C * sizeof(float));
+    uint8_t *vowel = tv_alloc(T);
     for (int t = 0, f = 0; t < N; t++) {
         int owned = dur[t] < 1 ? 1 : dur[t];
         float feat[3] = {0, 0, log1pf((float)owned) / 4.0f};
@@ -902,9 +925,11 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
             }
         }
     }
+    tv_free(x);
     // ---- prosody (its output replaces the frames; each row is read whole before it is overwritten)
-    stack_forward(&c, &m->prosody, "prosody_stack", frames, T, frames, 0, 0);
-    float *pros = xmalloc((size_t)T * 3 * sizeof(float));
+    float *rotary = rotary_table(T);    // the prosody and acoustic stacks run over the same positions
+    stack_forward(&c, &m->prosody, "prosody_stack", frames, T, frames, 0, 0, rotary);
+    float *pros = tv_alloc((size_t)T * 3 * sizeof(float));
     float *ac_in = frames;
     for (int f = 0; f < T; f++) {
         const float *row = frames + (size_t)f * TV_C;
@@ -922,15 +947,16 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
             ac_in[(size_t)f * TV_C + i] = row[i] + (w[0] * cond[0] + w[1] * cond[1] + w[2] * cond[2] + m->prosody_proj_b[i]);
         }
     }
+    tv_free(vowel);
     dbg(&c, "prosody", TV_F32, pros, T, 3);
     // ---- acoustic stack, vocoder heads (int8) and source-filter synthesis (float)
     int S = T * TV_HOP;
-    res->audio = opt->on_audio ? NULL : xmalloc((size_t)S * sizeof(float));
+    res->audio = opt->on_audio ? NULL : tv_alloc((size_t)S * sizeof(float));
     const int L = opt->acoustic_lookahead > 0 ? opt->acoustic_lookahead : 0, P = L ? opt->acoustic_past : 0;
     if (!opt->debug) {
-        acoustic_stream_run(&c, m, ac_in, pros, T, L, P, opt, res->audio);     // computed as the vocoder needs it
+        acoustic_stream_run(&c, m, ac_in, pros, T, L, P, rotary, res->audio);     // computed as the vocoder needs it
     } else {        // reference: one pass with the same mask, every tensor whole for the debug dumps
-        stack_forward(&c, &m->acoustic, "acoustic_stack", ac_in, T, ac_in, L, P);  // the final LN replaces ac_in
+        stack_forward(&c, &m->acoustic, "acoustic_stack", ac_in, T, ac_in, L, P, rotary);  // the final LN replaces ac_in
         dbg(&c, "acoustic", TV_F32, ac_in, T, TV_C);
         c.saturations += tv_vocode(m, ac_in, pros, T, opt, res->audio);
     }
@@ -938,6 +964,6 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
     res->n_frames = T;
     res->durations = dur;
     res->qacc_saturations = c.saturations;
-    tv_free(x); tv_free(hidden); tv_free(frames); tv_free(vowel); tv_free(pros);
+    tv_free(rotary); tv_free(frames); tv_free(pros);
     return 0;
 }

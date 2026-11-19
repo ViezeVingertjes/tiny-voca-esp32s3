@@ -7,14 +7,15 @@ rounds and clamps exactly where the engine holds int8:
   matmuls over [x[t-1], x[t], x[t+1]] windows);
 * activations entering a matmul: int8, symmetric, one static scale per tensor,
   calibrated as max|x| over calibration sentences; values beyond it saturate;
-* attention: Q and K (after rotary) and V int8, scores and softmax in float,
-  probabilities int8 in [0, 127] (scale 1/127);
+* attention: Q and K (after rotary) and V int8, scores in float; weights
+  round(127 * exp(score - rowmax)) (the largest of every row is 127), normalized by
+  their own sum;
 * GELU between `expand` and `project` maps int8 to int8 (a 256-entry table on device);
-* float: residual stream, LayerNorm, depthwise conv, softmax, the tiny 3-channel
+* float: residual stream, LayerNorm, depthwise conv, the tiny 3-channel
   linears, duration logic and the source-filter vocoder.
 
 Quantization points (keys of `scales`):
-  <stack>.<i>.ln1 .q .k .v .attn .dw .pre .gelu   for every block of encoder/prosody/acoustic
+  <stack>.blocks.<i>.ln1 .q .k .v .attn .dw .pre .gelu   for every block of encoder/prosody/acoustic
   dur.in dur.h1     inputs of the two duration convolutions
   voc.in            input of the vocoder's harmonic and noise heads
 """
@@ -105,7 +106,7 @@ class Golden:
         return F.layer_norm(x, (x.shape[-1],), module.weight, module.bias, module.eps)
 
     # ------------------------------------------------------------- blocks
-    def attention(self, prefix, block, x, table):
+    def attention(self, prefix, x, table):
         t, c = x.shape
         h, d = self.c.heads, c // self.c.heads
         qkv = self.linear(prefix + ".attention.qkv", self.act(prefix + ".ln1", x)).view(t, 3, h, d).permute(1, 2, 0, 3)
@@ -129,7 +130,7 @@ class Golden:
         return self.linear(prefix + ".attention.out", self.act(prefix + ".attn", y))
 
     def block(self, prefix, block, x, table):
-        x = x + self.attention(prefix, block, self.layer_norm(block.norm1, x), table)
+        x = x + self.attention(prefix, self.layer_norm(block.norm1, x), table)
         y = self.layer_norm(block.norm2, x)
         dw = block.depthwise
         y = F.conv1d(y.T[None], dw.weight, dw.bias, padding=dw.padding, groups=dw.groups)[0].T
@@ -220,4 +221,5 @@ class Golden:
         return self.scales
 
     def save_scales(self, path):
-        json.dump(self.scales, open(path, "w"), indent=1, sort_keys=True)
+        with open(path, "w") as f:
+            json.dump(self.scales, f, indent=1, sort_keys=True)

@@ -1,6 +1,9 @@
 // One sentence per stdin line -> "ids<TAB>stress" (comma-separated) per stdout line,
 // or "ERR <message>". Uses the C++ dizione port in third_party/dizione.
 //   dizione_cli /path/to/phonemizer < sentences.txt
+// Build (speak_s3.py looks for out/bin/dizione_cli):
+//   mkdir -p out/bin
+//   c++ -O2 -std=c++17 -Ithird_party/dizione -o out/bin/dizione_cli tools/dizione_cli.cpp third_party/dizione/*.cpp -lpthread
 #include "dizione.h"
 #include <iostream>
 #include <string>

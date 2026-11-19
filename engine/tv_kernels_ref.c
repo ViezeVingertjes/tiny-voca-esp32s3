@@ -1,5 +1,6 @@
 // Portable reference kernels (host). Emulates the ESP32-S3 QACC exactly, including
 // saturation, so overflow is caught on the host before it can corrupt device output.
+#define _POSIX_C_SOURCE 200112L     // posix_memalign, clock_gettime
 #include "tv_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,8 +26,17 @@ void tv_free(void *p) { free(p); }
 void *tv_alloc_fast(size_t n) { return tv_alloc(n); }
 
 void tv_kernels_init(void) {}
-int tv_linear_prepare(tv_linear *L) { (void)L; return 0; }
-void tv_linear_release(tv_linear *L) { (void)L; }
+int tv_linear_prepare(tv_linear *L) { return 0; }
+void tv_linear_release(tv_linear *L) {}
+
+static void epilogue_put(const tv_epilogue *e, void *out, size_t at, float y) {
+    if (e->mode == TV_EPI_STORE) ((float *)out)[at] = y;
+    else if (e->mode == TV_EPI_ADD) ((float *)out)[at] += y;
+    else {
+        int8_t q = tv_quant(y, e->inv);
+        ((int8_t *)out)[at] = e->lut ? e->lut[q + 128] : q;
+    }
+}
 
 long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {
     long saturations = 0;
@@ -45,13 +55,21 @@ long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const 
                 }
                 total += run - pre;
             }
-            tv_epilogue_put(e, out, (size_t)t * L->N + n, (float)total * (L->in_scale * L->ws[n]) + L->bias[n]);
+            epilogue_put(e, out, (size_t)t * L->N + n, (float)total * (L->in_scale * L->ws[n]) + L->bias[n]);
         }
     }
     return saturations;
 }
 
-void tv_parallel2(void (*fn)(void *), void *a, void *b) { fn(a); fn(b); }
+// One after the other; the flag catches nested calls here as the S3 backend would (it deadlocks).
+void tv_parallel2(void (*fn)(void *), void *a, void *b) {
+    static int busy;
+    if (busy) { fprintf(stderr, "tv: nested tv_parallel2\n"); abort(); }
+    busy = 1;
+    fn(a);
+    fn(b);
+    busy = 0;
+}
 
 static int32_t dot48(const int8_t *q, const int8_t *k) {
     int32_t s = 0;

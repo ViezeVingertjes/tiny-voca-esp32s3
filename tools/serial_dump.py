@@ -1,13 +1,22 @@
 """Read the firmware's console: print the log, decode TVDUMP base64 blocks into a TVQ1 file.
-Hard deadline; stops on TVDUMP_DONE, "tv: finished", a panic or a reboot.
+Hard deadline; stops on TVDUMP_DONE, "tv: finished", a failed test, a panic or a reboot.
 
-    python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev_test0.bin
+    python tools/serial_dump.py /dev/ttyACM0 180 out/dev.bin TEST     # COMMAND is sent once READY
 """
-import base64, signal, struct, sys, time
-import serial
+import argparse, base64, signal, sys, time
+from pathlib import Path
 
-port, timeout, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3]
-send = sys.argv[4].encode() + b"\n" if len(sys.argv) > 4 else None     # command to send once READY
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tvq1                                                   # noqa: E402
+import tvserial                                               # noqa: E402
+
+ap = argparse.ArgumentParser()
+ap.add_argument("port")
+ap.add_argument("seconds", type=float, help="hard deadline")
+ap.add_argument("out", help="TVQ1 file for the decoded dumps")
+ap.add_argument("command", nargs="?", help="console line to send once the board is READY (e.g. TEST)")
+args = ap.parse_args()
+send = args.command.encode() + b"\n" if args.command else None
 
 
 def bail(*_):
@@ -16,33 +25,22 @@ def bail(*_):
 
 
 signal.signal(signal.SIGALRM, bail)
-signal.alarm(int(timeout))
+signal.alarm(max(1, int(args.seconds)))
 
-s = None
-while s is None:
-    try:
-        s = serial.Serial()
-        s.port, s.baudrate, s.timeout = port, 115200, 0.2
-        s.rts = False  # only RTS: DTR low with RTS high resets the S3
-        s.open()
-    except Exception:
-        s = None
-        time.sleep(0.2)
+s = tvserial.open_port(args.port, wait=args.seconds)
 if send:
     s.write(b"\n")
 
 dumps, current, chunks, pending = {}, None, [], b""
-stop = (b"TVDUMP_DONE", b"tv: finished", b"Guru Meditation", b"Rebooting...", b"abort() was called")
-done = False
+finished = (b"TVDUMP_DONE", b"tv: finished", b"no test vector", b"synthesize failed")
+panic = tuple(m.encode() for m in tvserial.PANIC)
+done = panicked = False
 while not done:
     try:
         data = s.read(65536)
-    except Exception:
+    except Exception:           # the board went away (reboot): wait for the port to come back
         time.sleep(0.3)
-        try:
-            s = serial.Serial(port, 115200, timeout=0.2)
-        except Exception:
-            pass
+        s = tvserial.open_port(args.port, wait=args.seconds)
         continue
     pending += data
     while b"\n" in pending:
@@ -63,23 +61,12 @@ while not done:
             chunks.append(line)
         else:
             print(line)
-        if any(m in raw for m in stop):
-            done = True
-    if done and any(m in pending for m in stop[2:]):
-        time.sleep(1.0)
-        print(s.read(16384).decode(errors="replace"))
+        panicked = panicked or any(m in raw for m in panic)
+        done = done or panicked or any(m in raw for m in finished)
+if panicked:
+    time.sleep(1.0)             # the rest of the panic report
+    print((pending + s.read(16384)).decode(errors="replace"))
 
 if dumps:
-    header = 16 + 96 * len(dumps)
-    offset = (header + 15) & ~15
-    entries, blobs = [], []
-    for name, (blob, rows, cols) in dumps.items():
-        entries.append(struct.pack("<64sII4III", name.encode(), 0, 2, rows, cols, 1, 1, offset, len(blob)))
-        blobs.append((offset, blob))
-        offset = (offset + len(blob) + 15) & ~15
-    with open(out_path, "wb") as f:
-        f.write(b"TVQ1" + struct.pack("<III", 1, len(dumps), 0) + b"".join(entries))
-        for off, blob in blobs:
-            f.write(b"\0" * (off - f.tell()))
-            f.write(blob)
-    print(f"[wrote {out_path}: {', '.join(dumps)}]")
+    tvq1.write_raw(args.out, [(name, tvq1.F32, (rows, cols), blob) for name, (blob, rows, cols) in dumps.items()])
+    print(f"[wrote {args.out}: {', '.join(dumps)}]")

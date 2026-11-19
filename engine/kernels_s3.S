@@ -62,14 +62,14 @@ qacc_mm_s8:
     ee.st.qacc_h.h.32.ip a5, 16
     retw
 
-// int32_t attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m)
+// int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m)
 // max(m, dot(q, K[t*48 : t*48+48]) for t < n), exact in the 40-bit ACCX: the query stays in
 // q0..q2, keys stream through q3..q5 with each load issued by the previous multiply. Reads 16
 // bytes past the last key row.
     .align 4
-    .global attn_max48
-    .type attn_max48, @function
-attn_max48:
+    .global tv_attn_max48
+    .type tv_attn_max48, @function
+tv_attn_max48:
     entry a1, 32
     ee.vld.128.ip q0, a2, 16
     ee.vld.128.ip q1, a2, 16
@@ -88,7 +88,7 @@ attn_max48:
 
 // int32_t attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint32_t *lut_lim, int8_t *w)
 // lut_lim = {lut pointer, lim}. w[t] = lut[minu(m - dot_t, lim)], returns the sum of the w[t].
-// Same dot products as attn_max48.
+// Same dot products as tv_attn_max48 (called directly by the engine, see tv_kernels.h).
     .align 4
     .global attn_weights48
     .type attn_weights48, @function

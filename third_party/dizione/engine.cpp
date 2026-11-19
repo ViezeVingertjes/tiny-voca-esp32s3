@@ -54,7 +54,7 @@ Lexicon::Lexicon(std::string text) : text_(std::move(text)) {
 }
 
 void Lexicon::index() {
-    if (view_.size() > 0xFFFFFFFFULL) {
+    if (static_cast<uint32_t>(view_.size()) != view_.size()) {    // offsets are 32-bit (tiny-voca esp32: no type-limits warning)
         throw ValueError("the dictionary (lexicon.tsv) is too large");
     }
     const std::string_view all(view_);

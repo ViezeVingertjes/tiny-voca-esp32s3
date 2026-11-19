@@ -1,5 +1,5 @@
-// tiny-voca ESP32-S3 microbenchmarks: int8 matmul kernels, fp32 baseline,
-// memory bandwidth and the scalar math the vocoder needs.
+// tiny-voca ESP32-S3 microbenchmarks: int8 matmul kernels (QACC behaviour probe, GEMM variants);
+// with idf.py -DBASELINES=1 also an fp32 matmul, memory bandwidth and libm costs.
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -12,20 +12,20 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-int32_t dot_rows_s8_accx(const int8_t *x, const int8_t *W, int32_t *out, int N, int k16);
-void dot_cols_s8_accx(const int8_t *X, const int8_t *w, int32_t *out, int T, int k16, int out_stride_bytes);
-void qacc_block_s8(const int8_t *x, const int8_t *wblk, uint8_t *qacc_out, int k16);
 void read_vld(const void *p, int n16);
 void qacc_block_s8_v2(const int8_t *x, const int8_t *wblk, uint8_t *qacc_out, int k32);
 void qacc_probe(const int8_t *w, const int8_t *x, int n, uint8_t *out);
 void qacc_block_s8_q8(const int8_t *x, const int8_t *wblk, int8_t *out, int k32, const int32_t *mult, const uint8_t *bias_raw);
 
+#ifndef RUN_BASELINES
+#define RUN_BASELINES 0     // idf.py -DBASELINES=1 sets it
+#endif
 #define MHZ 240
 #define SRAM (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 static void *alloc(size_t n, uint32_t caps) {
-    void *p = heap_caps_aligned_alloc(16, n + 16, caps);   // +16: kernels over-read
+    void *p = heap_caps_aligned_alloc(16, n + 64, caps);   // +64: kernels over-read
     if (!p) {
         printf("ALLOC FAIL %u bytes caps=%" PRIx32 "\n", (unsigned)n, caps);
         abort();
@@ -267,7 +267,7 @@ static void bench_gemm_s8(void) {
     }
     heap_caps_free(Wp_sr);
 
-    // Weights in PSRAM (the real engine), outputs in SRAM.
+    // Weights in PSRAM (the engine maps them from flash, which shares the bus), outputs in SRAM.
     int32_t *out32 = alloc(T * N * 4, SRAM);
     job.Wp = Wp_ps; job.out = out32;
     for (int cores = 1; cores <= 2; cores++) {
@@ -371,11 +371,11 @@ void app_main(void) {
     go_sem = xSemaphoreCreateBinary();
     done_sem = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(worker, "worker", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
-#ifdef RUN_BASELINES
-    bench_memory();
-    bench_math();
-    bench_gemm_f32();
-#endif
+    if (RUN_BASELINES) {
+        bench_memory();
+        bench_math();
+        bench_gemm_f32();
+    }
     bench_probe();
     bench_gemm_s8();
     printf("\n#### tiny-voca bench done ####\n");

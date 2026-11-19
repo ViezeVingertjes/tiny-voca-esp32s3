@@ -3,21 +3,14 @@ flash partition of the ESP32-S3 firmware.
 
     python tools/pack_phonemizer.py $TINY_VOCA_WEIGHTS/phonemizer out/phonemizer.bin
 """
-import struct, sys
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tvq1                                                   # noqa: E402
 
 FILES = ("lexicon.tsv", "align.json", "g2p.json", "g2p.npz", "homographs.json")
 src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 blobs = [(name, (src / name).read_bytes()) for name in FILES]
-offset = (16 + 96 * len(blobs) + 15) & ~15
-entries, placed = [], []
-for name, data in blobs:
-    entries.append(struct.pack("<64sII4III", name.encode(), 1, 1, len(data), 1, 1, 1, offset, len(data)))
-    placed.append((offset, data))
-    offset = (offset + len(data) + 15) & ~15
-with open(dst, "wb") as f:
-    f.write(b"TVQ1" + struct.pack("<III", 1, len(blobs), 0) + b"".join(entries))
-    for off, data in placed:
-        f.write(b"\0" * (off - f.tell()))
-        f.write(data)
-print(f"{dst}: {offset / 1e6:.2f} MB, {', '.join(n for n, _ in blobs)}")
+size = tvq1.write_raw(dst, [(name, tvq1.I8, (len(data),), data) for name, data in blobs])
+print(f"{dst}: {size / 1e6:.2f} MB, {', '.join(n for n, _ in blobs)}")

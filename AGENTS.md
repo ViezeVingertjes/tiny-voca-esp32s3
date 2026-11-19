@@ -20,23 +20,28 @@ and write to this repo's `out/`.
 
 | Path | What |
 |---|---|
-| `tools/tvq.py` | **Golden model**: the exact int8 numerics the engine implements. This is the spec. |
-| `tools/quant_eval.py` | Renders quantization variants and measures them against fp32 (mel L1, F0 cents, voicing, durations) |
-| `tools/export.py` | Calibrates static scales, writes `out/tvoca.bin` and test vectors `out/test0.bin` / `out/test0_dev.bin` |
-| `tools/pack_phonemizer.py` | Packs dizione's data files into `out/phonemizer.bin` |
-| `tools/compare_dump.py` | Audio-level distance between two dumps (prosody + audio) |
-| `tools/serial_dump.py` | Reads the console, decodes `TVDUMP` base64 blocks into a dump; can send a command (`TEST`) |
-| `tools/console.py` | Sends console lines and prints replies up to the next `READY` |
-| `tools/speak_s3.py`, `tools/dizione_cli.cpp` | Mac phonemizes, board synthesizes (`SYN` command), WAV back |
-| `engine/` | Portable C engine (`tv.c` model, `tv_dsp.c` vocoder, `tv_kernels.h` backend interface) |
+| `engine/` | Portable C engine: `tv.h` API, `tv.c` model, `tv_dsp.c` vocoder, `tv_kernels.h` backend interface and engine internals |
 | `engine/tv_kernels_ref.c` | Host backend: plain C, **emulates the S3 QACC exactly** (20-bit saturation) |
+| `engine/tv_kernels_s3.c`, `engine/kernels_s3.S` | ESP32-S3 backend: PIE assembly kernels, both cores (built by `firmware/`) |
 | `engine/host/` | `tvhost`: runs the engine on the host and compares every tensor with the golden dump |
-| `firmware/main/` | ESP-IDF app: S3 kernels (`kernels_s3.S`, `tv_kernels_s3.c`), console (`main.c`), phonemizer glue, `board.h` |
+| `firmware/main/` | ESP-IDF app: console (`main.c`), sentence splitting, phonemizer glue, `board.h` |
 | `firmware/boards/<name>/` | One folder per board: `board.c`, `sdkconfig.defaults` (flash, PSRAM), `partitions.csv` |
-| `firmware/drivers/` | Hardware code shared by boards: ES8311 codec, I2S player (with a level tap), WS2812 LEDs |
-| `bench/` | Microbenchmarks of the S3 (SIMD kernels, memory bandwidth, libm) |
+| `firmware/drivers/` | Hardware code shared by boards: ES8311 codec and the audio bring-up, I2S player (with a level tap), WS2812 LEDs, I2C register helpers |
+| `firmware/run.sh` | Build, flash, run `TEST` and capture the dump, with hard timeouts |
+| `tools/tvq.py` | **Golden model**: the exact int8 numerics the engine implements. This is the spec. |
+| `tools/export.py` | Calibrates static scales, writes `out/tvoca.bin` and test vectors `out/test0.bin` / `out/test0_dev.bin` |
+| `tools/quant_eval.py` | Renders quantization variants and measures them against fp32 (mel L1, F0 cents, voicing, durations) |
+| `tools/pack_phonemizer.py` | Packs dizione's data files into `out/phonemizer.bin` |
+| `tools/compare_dump.py` | Audio-level distance between two dumps (prosody + audio); metrics in `audio_metrics.py` |
+| `tools/serial_dump.py` | Reads the console, decodes `TVDUMP` base64 blocks into a dump; can send a command (`TEST`) |
+| `tools/console.py` | Sends console lines and prints replies up to the next `READY` (`--boot`: reset, show the boot log) |
+| `tools/speak_s3.py`, `tools/dizione_cli.cpp` | Host phonemizes, board synthesizes (`SYN` command), WAV back |
+| `tools/tvq1.py`, `tools/tvserial.py`, `tools/tiny_voca_src.py` | Shared by the tools: the TVQ1 container, the serial port (auto-detected), the tiny-voca checkout and lexicon lookup |
+| `tools/hf_readme.md` | Model card template for the Hugging Face release |
+| `bench/` | Microbenchmarks of the S3 (QACC behaviour, matmul variants; `-DBASELINES=1`: fp32, memory bandwidth, libm) |
 | `third_party/dizione` | C++17 port of the dizione phonemizer, from audio.cpp PR #1311, with small patches (`PROVENANCE.md`) |
-| `monitor.sh` | Serial monitor that forwards stdin to the board |
+| `monitor.sh` | Serial monitor that forwards stdin to the board (`-r`: reset first) |
+| `out/` | Not in git: the prebuilt files from Hugging Face and everything the tools write |
 
 ## Numerics (the spec, `tools/tvq.py`)
 
@@ -60,11 +65,12 @@ and write to this repo's `out/`.
 
 ## Model file (`out/tvoca.bin`, TVQ1 container)
 
-Header `"TVQ1"`, version 1, count; 96-byte entries `{name[64], dtype, ndim, shape[4], offset, nbytes}`;
-data 16-byte aligned. dtype 0 f32, 1 i8, 2 i32. Per int8 linear `<base>`: `.wq` i8 `[Npad/16][K][16]`
+16-byte header `"TVQ1"`, version 1, count, reserved; 96-byte entries `{name[64], dtype, ndim, shape[4], offset, nbytes}`;
+data 16-byte aligned (`tv_file_open` rejects anything else). dtype 0 f32, 1 i8, 2 i32. Per int8 linear `<base>`: `.wq` i8 `[Npad/16][K][16]`
 (16 output channels interleaved, the QACC kernel layout), `.ws` f32 per-channel scale, `.b` f32 bias,
 `.pre` i32 `[chunks][N]` (project only). Activation scales are `<point>.max` f32 scalars. The same
-container format is used for the test vectors, the phonemizer data and dumps.
+container format is used for the test vectors, the phonemizer data and dumps; `tools/tvq1.py` reads
+and writes it.
 
 ## Engine
 
@@ -116,11 +122,11 @@ vocoder heads (int8), source-filter vocoder (float).
   before allocating; the console computes the budget from free PSRAM (~1,770 frames, 19 s) and
   falls back to splitting at commas.
 
-## S3 kernels (`firmware/main/kernels_s3.S`)
+## S3 kernels (`engine/kernels_s3.S`)
 
 - `qacc_mm_s8`: 16 outputs per call with `ee.vsmulas.s8.qacc.ld.incp` (one input value broadcast
   against 16 weights). Weights are loaded 3 instructions ahead (q1..q4 rotate), inputs one chunk ahead.
-  The accumulator starts from a 64-byte raw state (zero, bias or centring preload) and is stored raw;
+  The accumulator starts from a 64-byte raw state (zero, or the centring preload of `project`) and is stored raw;
   `unpack_qacc` reads the 2 x 8 lanes of 20 bits. 12.6 MAC/cycle kernel-only in the benchmark.
 - `attn_max48`, `attn_weights48`, `attn_pv64`: attention in the 40-bit ACCX (Q.K over 48 dims and
   weights.V could overflow 20 bits). The query (or 64 weights) stays in registers while rows stream.
@@ -132,6 +138,7 @@ vocoder heads (int8), source-filter vocoder (float).
 - Windowed ABI: never write the top 16 bytes of your own frame from assembly (it is the caller's
   register spill area); this once corrupted a return address.
 - `tv_parallel2(fn, a, b)` runs two jobs on the two cores (the worker task on core 1 has an 8 KB stack).
+  It is not re-entrant (a job must not call it, nor `tv_linear_run`); both backends abort on a nested call.
 
 ## Phonemizer
 
@@ -139,7 +146,16 @@ vocoder heads (int8), source-filter vocoder (float).
 3.3 MB lexicon is read from mapped flash (`Lexicon::external`), `parse_npz` reads the model from
 memory, and the unknown-word GRU is faster (weight rows read once per word, the two directions on
 both cores, dot lanes in registers, memoized words), with identical results. Dictionary words cost
-about 0.2 ms each, unknown words about 0.3 s. Setup takes 3.5 s at boot.
+about 0.2 ms each, unknown words about 0.3 s. Setup takes 3.5 s at boot. On the host,
+`tools/dizione_cli.cpp` wraps the same code for `speak_s3.py`:
+
+```bash
+mkdir -p out/bin && c++ -O2 -std=c++17 -Ithird_party/dizione -o out/bin/dizione_cli \
+    tools/dizione_cli.cpp third_party/dizione/*.cpp -lpthread
+```
+
+The firmware compiles every dizione source, but the linker keeps only what is reachable
+(`--gc-sections`): about 624 of its 632 KB are, mostly Unicode and normalization tables.
 
 ## Boards
 
@@ -169,7 +185,7 @@ TCA9555 expander (0x20): only port 1 bit 0 is ever written, with read-modify-wri
 expander port 0**: pins 6/7 are the USB/camera mux and the wrong level kills USB.
 The ring of 7 WS2812B LEDs on GPIO 38 is a sound level meter (`meter()` in `board.c`): the I2S
 player reports the RMS of each 10 ms piece as it is heard (levels delayed by the 4-piece DMA depth),
-mapped from -45 to -9 dB onto the LEDs, green, yellow, red, instant rise and a ~0.35 s fall.
+mapped from -45 to -9 dB onto the LEDs, green, yellow, red, instant rise and a ~0.23 s fall.
 
 Flash: app 2 MB at 0x10000, `model` 6 MB at 0x210000, `testvec` 1 MB at 0x810000, `phonemizer` 6 MB
 at 0x910000 (`boards/waveshare_s3_audio/partitions.csv`). The model is memory-mapped from flash;
@@ -191,7 +207,7 @@ Checked 2026-11-17 against [the Waveshare docs](https://docs.waveshare.com/ESP32
 [demo code](https://github.com/waveshareteam/ESP32-S3-ePaper-1.54). Same ES8311 codec, a 200 x 200
 e-paper screen for `board_show_text`. Two versions, and their example code is not interchangeable:
 V1 is an ESP32-S3FH4R2 (4 MB flash, 2 MB quad PSRAM): the int8 model alone (4.85 MB) is larger
-than the flash, so it would need int4 weights (~2.4 MB) and the Mac doing the phonemizing.
+than the flash, so it would need int4 weights (~2.4 MB) and the host doing the phonemizing.
 V2 ("V2" printed top-left on the PCB, since Nov 2025) is an ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB
 PSRAM): it needs the phonemizer data compacted (the 3.3 MB lexicon text, float G2P weights) to fit.
 
@@ -216,8 +232,10 @@ cd build/release && esptool --chip esp32s3 merge-bin -o ../../../out/hf/<board>/
 
 `out/hf/` also holds `tvoca.bin`, `phonemizer.bin`, `test0_dev.bin`, `licenses/` (tiny-voca,
 CMUdict and homograph data, whose contents are inside `phonemizer.bin`) and the model card
-`README.md`. Flash the exact files once before uploading (`hf upload ngxson/tiny-voca-esp32s3 out/hf .`),
-then run `TEST` and compare with the host.
+`README.md`: `tools/hf_readme.md` with `SHA256_TABLE` (`sha256sum` of the files) and `COMMIT` filled
+in, and a row in its file table per board uploaded (today only `waveshare_s3_audio`). Flash the exact
+files once before uploading (`hf upload ngxson/tiny-voca-esp32s3 out/hf .`), then run `TEST` and
+compare with the previous board dump.
 
 ## Validation workflow
 
@@ -227,12 +245,24 @@ Order of trust: fp32 PyTorch, golden model (`tvq.py`), host engine, board.
 python tools/export.py                                  # also writes the golden dump test0.bin
 make -C engine/host
 engine/host/tvhost out/tvoca.bin out/test0.bin out/c.wav --quiet --twice --dump out/c.bin
-python tools/serial_dump.py /dev/cu.usbmodem1201 180 out/dev.bin TEST
-python tools/compare_dump.py out/c.bin out/dev.bin       # board vs host: must be 0.00 dB, 0 cents
-python tools/compare_dump.py out/test0.bin out/dev.bin   # vs golden: ~0.9-1.0 dB, ~2 cents
+esptool write-flash 0x810000 out/test0_dev.bin           # once: the test vector TEST runs
+python tools/serial_dump.py /dev/ttyACM0 180 out/dev.bin TEST      # macOS: /dev/cu.usbmodem*
+python tools/compare_dump.py out/c.bin out/dev.bin       # board vs host: ~0-0.2 dB, 0 cents
+python tools/compare_dump.py out/test0.bin out/dev.bin   # vs golden: ~0.9-1.0 dB, ~2-4 cents
 ```
 
-- Host refactors must keep the host output **bit-identical** (`cmp` of the dumps or `np.array_equal`).
+`tvhost` also runs on `test0_dev.bin` (the inputs only): it then compares nothing but still writes
+the audio and `--dump`. `--lookahead N --past N` selects the streamed acoustic mask.
+
+- The S3 build fuses float multiply-adds (GCC `-ffp-contract=fast` for `gnu23`: `madd.s`), the
+  host build does not (`-ffp-contract=off` in its Makefile, so every host gives the same floats),
+  and the libm differs. So board and host are close, not bit-identical (on Linux 0.21 dB, 0 cents on
+  `test0`), and a change that keeps the host bit-identical can still change the board: GCC fuses
+  across statements after inlining. Forcing `-ffp-contract=off` on the S3 would make them equal at
+  the cost of speed and a new board reference.
+- Refactors must keep the output **bit-identical** on both: the host (`cmp` of the `--dump` or WAV
+  files, with and without `--lookahead 32 --past 512`) and the board (`cmp` of the `TEST` dumps
+  before and after, which also checks the debug path against the production path).
 - Host vs golden is not bit-exact: tiny float differences flip int8 codes near rounding boundaries
   and spread through the hard thresholds (rounding, voicing, durations). The golden model nudged by
   1e-6 diverges from itself just as much (~0.94 dB, ~3.7 cents); that is the noise floor.
@@ -240,7 +270,7 @@ python tools/compare_dump.py out/test0.bin out/dev.bin   # vs golden: ~0.9-1.0 d
 
 ## Performance (board)
 
-A 3.3 s test sentence: 3.1 s (`TEST`, production path, full attention). Playback starts 0.5 s into
+A 3.3 s test sentence: 3.0 s (`TEST`, production path, full attention). Playback starts 0.5 s into
 "Hi." and (after a 0.4 s pre-roll, which only longer utterances need) 1.5 s into a 2.9 s sentence, 2.3 s into 5.6 s, 2.8 s into 7.5 s, 3.9 s into 10.2 s
 and 9.4 s into 21 s, and runs without gaps; the console reports any (`gaps` in its summary). The
 prosody stack over the whole utterance is what is left before the first sound, and it grows with
@@ -251,9 +281,14 @@ nothing.
 
 ## Working rules
 
-- Every build, flash and serial read runs under a hard timeout (macOS has no `timeout`:
-  `perl -e 'alarm shift; exec @ARGV' SECS cmd`); serial readers stop on panic and reboot too.
+- Every build, flash and serial read runs under a hard timeout (Linux: `timeout SECS cmd`; macOS
+  has none: `perl -e 'alarm shift; exec @ARGV' SECS cmd`); serial readers stop on panic and reboot too.
+- The serial tools find the board themselves (Espressif USB id, else the first `/dev/ttyACM*` or
+  `/dev/cu.usbmodem*`) and open it without resetting it; `--port` overrides.
 - ESP-IDF's Python has no numpy: run `compare_dump.py` and the export tools with the project's Python.
-- If flashing says the port is busy, check `lsof /dev/cu.usbmodem*` (a monitor may hold it).
+  `serial_dump.py`, `console.py`, `tvq1.py` and `tvserial.py` need only pyserial.
+- If flashing says the port is busy, check `lsof /dev/ttyACM* /dev/cu.usbmodem*` (a monitor may hold it).
+- `sdkconfig.defaults` only seeds a new configuration: after changing it (or a board's), delete
+  `firmware/sdkconfig.<board>` so the next build regenerates it.
 - The firmware build uses `-Werror`; `tv.h` and `tv_kernels.h` have `extern "C"` guards for the C++ glue.
 - Commit messages: imperative subject, body explaining what and why; no co-author lines.

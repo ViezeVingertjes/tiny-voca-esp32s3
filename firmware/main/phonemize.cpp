@@ -4,7 +4,6 @@
 #include "tv.h"
 #include "tv_kernels.h"
 #include <cstdio>
-#include <cstring>
 #include <memory>
 #include <string>
 
@@ -42,6 +41,7 @@ extern "C" int tvp_phonemize(const char *text, int32_t *ids, int32_t *stress, in
     try {
         dizione::Phonemized p = g_phonemizer->phonemize(text);
         int n = (int)p.ids.size();
+        if (n == 0) { snprintf(g_error, sizeof g_error, "no phonemes"); return 0; }
         if (n > max) { snprintf(g_error, sizeof g_error, "too many phonemes (%d > %d)", n, max); return -2; }
         for (int i = 0; i < n; i++) { ids[i] = p.ids[i]; stress[i] = p.stress[i]; }
         return n;

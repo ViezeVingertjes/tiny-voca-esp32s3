@@ -1,6 +1,7 @@
-// Compute kernels behind the engine. Two backends with identical integer results:
+// Compute kernels behind the engine, and what the engine's files share among themselves.
+// Two backends with identical integer results:
 //   tv_kernels_ref.c  portable C; emulates the S3 QACC (20-bit saturating lanes)
-//   firmware/main/tv_kernels_s3.c  ESP32-S3 PIE assembly, both cores
+//   tv_kernels_s3.c   ESP32-S3: PIE assembly (kernels_s3.S), both cores; built by firmware/
 #pragma once
 #include "tv.h"
 
@@ -40,16 +41,8 @@ static inline int8_t tv_quant(float x, float inv) {
     return (int8_t)((int32_t)(q + 12582912.0f) - 12582912);
 }
 
-static inline void tv_epilogue_put(const tv_epilogue *e, void *out, size_t at, float y) {
-    if (e->mode == TV_EPI_STORE) ((float *)out)[at] = y;
-    else if (e->mode == TV_EPI_ADD) ((float *)out)[at] += y;
-    else {
-        int8_t q = tv_quant(y, e->inv);
-        ((int8_t *)out)[at] = e->lut ? e->lut[q + 128] : q;
-    }
-}
-
-// Runs fn(a) and fn(b), on the two cores where there are two. fn must not call tv_linear_run.
+// Runs fn(a) and fn(b), on the two cores where there are two. Not re-entrant: fn must not call
+// tv_parallel2 (tv_linear_run does).
 void tv_parallel2(void (*fn)(void *), void *a, void *b);
 
 // Attention over one head (dimension 48), dots d[t] = q . K[t*48 : t*48+48] for t < n:
@@ -59,6 +52,23 @@ int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m);
 int32_t tv_attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint8_t *lut, uint32_t lim, int8_t *w);
 // acc[d] += sum_t w[t] * v[d*128 + t] for d < 48, t < 128 (one key chunk of transposed values).
 void tv_attn_pv48(const int8_t *w, const int8_t *v, int32_t *acc);
+
+uint64_t tv_time_us(void);
+
+// ---------------------------------------------------------------- engine internals
+// Profile: microseconds per op category, reported by tv_profile_report.
+enum { TV_P_MATMUL, TV_P_ATTN_DOT, TV_P_ATTN_PV, TV_P_NORM, TV_P_DW, TV_P_QUANT, TV_P_GELU, TV_P_ROPE,
+       TV_P_VOC_CEP, TV_P_VOC_SHAPE, TV_P_COUNT };
+extern uint64_t tv_prof[TV_P_COUNT];
+#define TV_PROF(id, stmt) do { uint64_t tv_t0_ = tv_time_us(); stmt; tv_prof[id] += tv_time_us() - tv_t0_; } while (0)
+
+// The vocoder (tv_dsp.c). Frame f of harmonic [T][TV_HARM_PARAMS], noise_params [T][TV_NOISE_PARAMS]
+// and f0 [T] is at f % ring (ring 0: T, whole arrays). need (may be NULL) is called before each
+// block with the number of leading frames that must be final by then, so the caller can compute
+// them as they are asked for.
+typedef void (*tv_need_fn)(void *user, int frames);
+void tv_vocoder_stream(const float *harmonic, const float *noise_params, const float *f0, const float *noise,
+                       uint64_t seed, int T, int ring, tv_audio_fn sink, void *user, tv_need_fn need, void *need_user);
 
 #ifdef __cplusplus
 }

@@ -1,13 +1,14 @@
 # Provenance
 
-Copied unchanged from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp),
+Copied from [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp),
 `src/community_models/tiny_voca/dizione`, at commit cfc30b04b867c7781ee4881f128902a065a73c8e
 (added in PR #1311). It is the C++17 port of [dizione](https://github.com/n4ze3m/dizione),
-tiny-voca's phonemizer. License: Apache-2.0 (`LICENSE`, from audio.cpp).
+tiny-voca's phonemizer, with the local changes below. License: Apache-2.0 (`LICENSE`, from audio.cpp).
 
-Used by `esp32/tools/dizione_cli.cpp` to phonemize text on the host for the ESP32-S3 engine.
+Used by the firmware (`firmware/main/phonemize.cpp`, the text typed on the board) and by
+`tools/dizione_cli.cpp` (phonemizing on the host for `tools/speak_s3.py`).
 
-## Local change
+## Local changes
 
 `Lexicon` can refer to text it does not own (`Lexicon::external`, `Data::lexicon_view`), so the
 ESP32-S3 can read the 3.3 MB `lexicon.tsv` from memory-mapped flash instead of copying it into RAM.
@@ -18,3 +19,6 @@ Unknown-word model (`g2p.*`), for speed on the ESP32-S3, results unchanged: the 
 loops weight-row outer so each row is read once per word; the two GRU directions can run through
 a `g2p_parallel` hook (on both cores); predictions are memoized (up to 512 words); `dot` keeps its
 eight lanes in named locals (registers) instead of an array.
+
+`Lexicon::index` checks that the lexicon fits 32-bit offsets without a comparison that is always
+false where `size_t` is 32 bits (a `-Wtype-limits` error under the firmware's `-Werror`).

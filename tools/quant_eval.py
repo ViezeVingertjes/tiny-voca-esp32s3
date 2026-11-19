@@ -14,21 +14,16 @@ measured with the fp32 durations forced, so the waveforms line up frame by frame
 
     python tools/quant_eval.py --output out/quant
 """
-import argparse, copy, math, os, sys, wave
+import argparse, copy, math, sys, wave
 from pathlib import Path
 import torch
 
-REPO = Path(__file__).resolve().parents[1]                     # this repo; outputs go to REPO / "out"
-# The tiny-voca source (for the model code) and its weights; only needed to export or evaluate.
-TINY_VOCA = Path(os.environ.get("TINY_VOCA_DIR", REPO.parent)).resolve()
-WEIGHTS = Path(os.environ.get("TINY_VOCA_WEIGHTS",
-                              TINY_VOCA / "weights" if (TINY_VOCA / "weights").exists() else TINY_VOCA.parent / "models/tiny-voca"))
-sys.path.insert(0, str(TINY_VOCA / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tiny_voca_src import REPO, WEIGHTS, load_lexicon, phonemize           # noqa: E402  (also puts tiny_voca on the path)
 from tiny_voca.infer import load_model, limit_peak                      # noqa: E402
 from tiny_voca.model import Attention, rotate                            # noqa: E402
-from tiny_voca.text import chunks, normalize_text, tokenize, parse_espeak  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tvq import Golden                                                    # noqa: E402
+from audio_metrics import compare                                        # noqa: E402
 
 SENTENCES = [
     "Hello! This is a small voice that can read to you.",
@@ -65,30 +60,6 @@ VARIANTS = {
     "golden-fp": "golden-fp",       # golden model, float: must score 0 (checks the re-implementation)
     "golden-w8a8": "golden-w8a8",   # golden model, int8 weights + static activation scales (the engine spec)
 }
-
-
-# ---------------------------------------------------------------- phonemes
-def load_lexicon(path):
-    lexicon = {}
-    for line in open(path, encoding="utf-8"):
-        word, phones = line.rstrip("\n").split("\t")
-        lexicon.setdefault(word, phones.replace(" ", "_"))
-    return lexicon
-
-
-def phonemize(text, lexicon):
-    pieces = []
-    for punctuation, piece in chunks(normalize_text(text)):
-        if punctuation:
-            pieces.append((True, piece))
-            continue
-        words = []
-        for word in piece.lower().split():
-            if word not in lexicon:
-                raise KeyError(f"{word!r} is not in the lexicon; pick another word")
-            words += parse_espeak(lexicon[word])
-        pieces.append((False, words))
-    return tokenize(pieces)
 
 
 # ---------------------------------------------------------------- fake quantization
@@ -136,33 +107,8 @@ def quantized_model(model, bits, group, activations):
     return model
 
 
-# ---------------------------------------------------------------- metrics
-def log_mel(audio, sample_rate=24000):
-    spec = torch.stft(audio, 1024, 256, window=torch.hann_window(1024), return_complex=True).abs() ** 2
-    freqs = torch.linspace(0, sample_rate / 2, spec.shape[0])
-    mel = 2595 * torch.log10(1 + freqs / 700)
-    edges = torch.linspace(0, float(mel[-1]), 82)
-    bank = torch.clamp(torch.minimum((mel[None] - edges[:-2, None]) / (edges[1:-1, None] - edges[:-2, None]),
-                                     (edges[2:, None] - mel[None]) / (edges[2:, None] - edges[1:-1, None])), min=0)
-    return 10 * torch.log10(bank @ spec + 1e-8)
-
-
-def compare(ref, test):
-    """ref/test: dicts with audio, prosody (frames x 3) from the same durations."""
-    a, b = ref["audio"], test["audio"]
-    ma, mb = log_mel(a), log_mel(b)
-    loud = ma.max(0).values > ma.max() - 60                 # skip silent frames
-    mel_db = float((ma - mb).abs()[:, loud].mean())
-    pa, pb = ref["prosody"], test["prosody"]
-    voiced = (pa[:, 1] > 0) & (pb[:, 1] > 0)
-    cents = float(((pa[voiced, 0] - pb[voiced, 0]) * 1200 / math.log(2)).pow(2).mean().sqrt())
-    flips = float(((pa[:, 1] > 0) != (pb[:, 1] > 0)).float().mean())
-    return mel_db, cents, flips
-
-
 # ---------------------------------------------------------------- main
-def run(model, tokens, voice, durations=None, seed=0):
-    p = tokens
+def run(model, p, voice, durations=None, seed=0):
     if isinstance(model, Golden):
         return model.synthesize(p.ids, p.stress, voice, seed=seed, durations=durations)
     args = (torch.tensor([p.ids]), torch.tensor([p.stress]), torch.tensor([len(p.ids)]), torch.tensor([voice]))

@@ -1,12 +1,9 @@
 """Export tiny-voca for the ESP32-S3 engine, plus a test vector from the golden model.
 
-    python tools/export.py            # writes out/tvoca.bin and out/test0.bin
+    python tools/export.py            # writes out/tvoca.bin, out/test0.bin and out/test0_dev.bin
+    (test<N>.bin with --test-sentence N; test<N>_dev.bin holds only what the board needs)
 
-Container format (little-endian), shared by both files:
-    header   "TVQ1", u32 version (1), u32 count, u32 reserved
-    entries  count x { char name[64]; u32 dtype; u32 ndim; u32 shape[4]; u32 offset; u32 nbytes }
-    data     each tensor 16-byte aligned; offset counts from the start of the file
-    dtype    0 f32, 1 i8, 2 i32
+All three are TVQ1 containers (tools/tvq1.py).
 
 Per int8 linear `<base>` (convolutions as [out, 3*in] matrices on [x[t-1], x[t], x[t+1]]):
     <base>.wq   i8  [Npad/16, K, 16]  output channels tiled by 16, as the QACC kernel reads them
@@ -18,41 +15,18 @@ Activation points: `<point>.max` f32 [1] = calibrated max|x| (int8 scale is max/
 points the int8 code q stands for (q + 128) * (max - GELU_MIN) / 255 + GELU_MIN).
 Everything else is copied as f32 under its PyTorch name.
 """
-import argparse, struct, sys
+import argparse, sys
 from pathlib import Path
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import quant_eval as qe                                       # noqa: E402
+from tiny_voca_src import REPO, WEIGHTS, load_lexicon, phonemize  # noqa: E402
+import tvq1                                                   # noqa: E402
 from tvq import Golden, weight_int8, conv_as_matrix           # noqa: E402
 
 PROJECT_CHUNKS = 2
-DTYPES = {np.float32: 0, np.int8: 1, np.int32: 2}
-
-
-def write_container(path, tensors):
-    names = list(tensors)
-    header = 16 + 96 * len(names)
-    offset = (header + 15) & ~15
-    entries, blobs = [], []
-    for name in names:
-        a = np.ascontiguousarray(tensors[name])
-        if a.dtype.type not in DTYPES:
-            raise TypeError(f"{name}: unsupported dtype {a.dtype}")
-        if len(name) >= 64 or a.ndim > 4:
-            raise ValueError(name)
-        shape = list(a.shape) + [1] * (4 - a.ndim)
-        entries.append(struct.pack("<64sII4III", name.encode(), DTYPES[a.dtype.type], a.ndim, *shape, offset, a.nbytes))
-        blobs.append((offset, a.tobytes()))
-        offset = (offset + a.nbytes + 15) & ~15
-    with open(path, "wb") as f:
-        f.write(b"TVQ1" + struct.pack("<III", 1, len(names), 0))
-        f.write(b"".join(entries))
-        for off, blob in blobs:
-            f.write(b"\0" * (off - f.tell()))
-            f.write(blob)
-    return offset
 
 
 def tile16(q):
@@ -78,18 +52,18 @@ def project_preload(wq, mean_code, chunks):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default=str(qe.WEIGHTS / "tiny-voca.pt"))
-    parser.add_argument("--lexicon", default=str(qe.WEIGHTS / "phonemizer/lexicon.tsv"))
-    parser.add_argument("--output", default=str(qe.REPO / "out"))
+    parser.add_argument("--checkpoint", default=str(WEIGHTS / "tiny-voca.pt"))
+    parser.add_argument("--lexicon", default=str(WEIGHTS / "phonemizer/lexicon.tsv"))
+    parser.add_argument("--output", default=str(REPO / "out"))
     parser.add_argument("--test-sentence", type=int, default=0)
     parser.add_argument("--test-voice", type=int, default=1)
     args = parser.parse_args()
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
 
-    lexicon = qe.load_lexicon(args.lexicon)
+    lexicon = load_lexicon(args.lexicon)
     model = qe.load_model(args.checkpoint, check_frontend=False)
     golden = Golden(model)
-    calibration = [qe.phonemize(s, lexicon) for s in qe.CALIBRATION]
+    calibration = [phonemize(s, lexicon) for s in qe.CALIBRATION]
     with torch.inference_mode():
         golden.calibrate([(p.ids, p.stress) for p in calibration])
         # mean GELU code per input channel of every `project`, for the centring preload
@@ -104,9 +78,10 @@ def main():
                         counts[key] = counts.get(key, 0) + codes.shape[0]
 
     tensors = {}
-    sd = {k: v.detach().float().numpy() for k, v in model.state_dict().items()}
+    state = model.state_dict()
+    sd = {k: v.detach().float().numpy() for k, v in state.items()}
     for base in golden.w:
-        w = model.state_dict()[base + ".weight"]
+        w = state[base + ".weight"]
         matrix = conv_as_matrix(w) if w.ndim == 3 else w
         q, scale = weight_int8(matrix)
         q = q.numpy().astype(np.int8)
@@ -124,12 +99,12 @@ def main():
         if base in golden.w and name.endswith((".weight", ".bias")):
             continue
         tensors[name] = value.astype(np.float32)
-    size = write_container(out / "tvoca.bin", tensors)
+    size = tvq1.write(out / "tvoca.bin", tensors)
     int8_bytes = sum(v.nbytes for k, v in tensors.items() if k.endswith(".wq"))
     print(f"tvoca.bin: {size / 1e6:.2f} MB ({int8_bytes / 1e6:.2f} MB int8 weights, {len(tensors)} tensors)")
 
     # ---------------------------------------------------------------- test vector
-    p = qe.phonemize(qe.SENTENCES[args.test_sentence], lexicon)
+    p = phonemize(qe.SENTENCES[args.test_sentence], lexicon)
     with torch.inference_mode():
         result = golden.synthesize(p.ids, p.stress, args.test_voice, seed=0, dump=True)
     dump = golden.dump
@@ -141,10 +116,11 @@ def main():
             continue
         v = value.detach().numpy()
         test[name] = v.astype(np.int8 if v.dtype == np.int8 else np.int32 if v.dtype.kind in "iu" else np.float32)
-    size = write_container(out / "test0.bin", test)
+    stem = f"test{args.test_sentence}"
+    size = tvq1.write(out / f"{stem}.bin", test)
     slim = {k: test[k] for k in ("ids", "stress", "voice", "noise", "durations")}
-    write_container(out / "test0_dev.bin", slim)          # what the device needs (flash partition)
-    print(f"test0.bin: {size / 1e6:.2f} MB, {len(p.ids)} tokens, {int(result['durations'].sum())} frames, "
+    tvq1.write(out / f"{stem}_dev.bin", slim)        # what the device needs (flash partition)
+    print(f"{stem}.bin: {size / 1e6:.2f} MB, {len(p.ids)} tokens, {int(result['durations'].sum())} frames, "
           f"voice {args.test_voice}: {qe.SENTENCES[args.test_sentence]!r}")
 
 

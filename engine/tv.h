@@ -1,5 +1,5 @@
 // tiny-voca inference engine: portable C, int8 matmuls (W8A8) with the numerics
-// specified by esp32/tools/tvq.py. The same code runs on the host (reference and
+// specified by tools/tvq.py. The same code runs on the host (reference and
 // validation) and on the ESP32-S3 (where the matmul is replaced by PIE kernels).
 #pragma once
 #include <stddef.h>
@@ -18,6 +18,15 @@ extern "C" {
 #define TV_HOP 256
 #define TV_SAMPLE_RATE 24000
 #define TV_QACC_MAX 524287  // QACC lanes are 20-bit signed and saturate
+#define TV_VOCAB 76         // token ids 0 .. 75
+#define TV_STRESS 3         // stress levels 0 .. 2
+#define TV_VOICES 2         // 0 F2, 1 M2
+#define TV_ENCODER_BLOCKS 4
+#define TV_PROSODY_BLOCKS 2
+#define TV_ACOUSTIC_BLOCKS 5
+#define TV_BLOCKS (TV_ENCODER_BLOCKS + TV_PROSODY_BLOCKS + TV_ACOUSTIC_BLOCKS)
+#define TV_HARM_PARAMS 98   // vocoder harmonic head: 80 causal + 16 anticausal cepstrum, 2 gains
+#define TV_NOISE_PARAMS 36  // vocoder noise head: 32 cepstrum, 4 gains
 
 // ---------------------------------------------------------------- container (export.py)
 typedef struct {
@@ -67,7 +76,7 @@ typedef struct {
     tv_file file;
     const float *tokens, *stress, *voices, *frame_voices;   // embeddings
     tv_stack encoder, prosody, acoustic;
-    tv_block block_storage[11];
+    tv_block block_storage[TV_BLOCKS];
     // duration predictor
     tv_linear dur1, dur2;
     const float *dnorm1_w, *dnorm1_b, *dnorm2_w, *dnorm2_b, *dur_out_w, *dur_out_b;
@@ -91,7 +100,8 @@ typedef void (*tv_debug_fn)(void *user, const char *name, int dtype, const void 
 
 typedef struct {
     float speed;                    // 1.0
-    const float *noise;             // NULL: engine's own Gaussian noise; else n_frames*TV_HOP values
+    const float *noise;             // NULL: engine's own Gaussian noise; else noise_len values,
+    int noise_len;                  // at least n_frames * TV_HOP (else TV_BAD_INPUT)
     uint32_t seed;
     const int32_t *force_durations; // NULL: predicted
     int max_frames;                 // > 0: return TV_TOO_LONG instead of synthesizing more frames
@@ -109,12 +119,16 @@ typedef struct {
 } tv_options;
 
 typedef struct {
-    float *audio;                   // n_samples (caller frees)
+    float *audio;                   // n_samples (caller frees with tv_free)
     int n_samples, n_frames;
-    int32_t *durations;             // n_tokens (caller frees)
+    int32_t *durations;             // n_tokens (caller frees with tv_free)
     long qacc_saturations;          // must be 0
 } tv_result;
 
+// tv_synthesize returns 0 or one of these (tv_result is then empty, but for n_frames of TV_TOO_LONG).
+#define TV_BAD_INPUT (-1)           // no tokens, an id, stress, voice or forced duration out of range,
+                                    // or too little noise
+#define TV_NO_FRAMES (-2)           // every duration is 0
 #define TV_TOO_LONG (-3)            // predicted frames exceed tv_options.max_frames; split the text
 int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, int n_tokens, int voice,
                   const tv_options *opt, tv_result *out);
@@ -123,24 +137,9 @@ int tv_synthesize(const tv_model *m, const int32_t *ids, const int32_t *stress, 
 // Returns saturations.
 long tv_vocode(const tv_model *m, const float *acoustic, const float *prosody, int T, const tv_options *opt, float *audio);
 
-// ---------------------------------------------------------------- profiling (microseconds per op category)
-enum { TV_P_MATMUL, TV_P_EPILOGUE, TV_P_ATTN_DOT, TV_P_SOFTMAX, TV_P_ATTN_PV, TV_P_NORM, TV_P_DW, TV_P_QUANT, TV_P_GELU, TV_P_ROPE,
-       TV_P_VOC_CEP, TV_P_VOC_SHAPE, TV_P_VOC_PULSE, TV_P_COUNT };
-extern uint64_t tv_prof[TV_P_COUNT];
-uint64_t tv_time_us(void);          // provided by the kernel backend
+// ---------------------------------------------------------------- profiling
 void tv_profile_reset(void);
-void tv_profile_report(void);       // printf, one line per category
-#define TV_PROF(id, stmt) do { uint64_t tv_t0_ = tv_time_us(); stmt; tv_prof[id] += tv_time_us() - tv_t0_; } while (0)
-
-// ---------------------------------------------------------------- internals shared with the DSP file
-// Frame f of harmonic, noise_params and f0 is at f % ring (ring 0: T, whole arrays). need (may be
-// NULL) is called before each block with the number of leading frames that must be final by then,
-// so the caller can compute them as they are asked for.
-typedef void (*tv_need_fn)(void *user, int frames);
-void tv_vocoder_stream(const float *harmonic, const float *noise_params, const float *f0, const float *noise,
-                       uint64_t seed, int T, int ring, tv_audio_fn sink, void *user, tv_need_fn need, void *need_user);
-void tv_vocoder(const float *harmonic /*[T][98]*/, const float *noise_params /*[T][36]*/, const float *f0 /*[T]*/,
-                const float *noise /*[T*hop]*/, int T, float *audio /*[T*hop]*/);
+void tv_profile_report(void);       // printf, one line per op category (time spent since the reset)
 
 #ifdef __cplusplus
 }

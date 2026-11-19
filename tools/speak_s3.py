@@ -1,49 +1,20 @@
-"""Text -> phonemes on the Mac -> synthesis on the ESP32-S3 -> WAV, with a keep-up report.
+"""Text -> phonemes on the host -> synthesis on the ESP32-S3 -> WAV, with a keep-up report.
 
     python tools/speak_s3.py --text "Hello there. How are you today?" --out out/s3.wav
 
 The firmware (firmware/) must be running its command server. Phonemes come from the C++
-dizione port (out/bin/dizione_cli, built from third_party/dizione); without that
+dizione port (out/bin/dizione_cli, see tools/dizione_cli.cpp for the build); without that
 binary a plain lexicon lookup is used and words missing from the lexicon are skipped.
 Keep-up model: sentences are synthesized one after another and each plays as soon as it is
 ready and the previous one has finished; any wait between sentences is a gap.
 """
-import argparse, base64, os, signal, subprocess, sys, time, wave
+import argparse, base64, signal, subprocess, sys, time, wave
 from pathlib import Path
-import serial
 
-REPO = Path(__file__).resolve().parents[1]                     # this repo; outputs go to REPO / "out"
-# The tiny-voca source (for the model code) and its weights; only needed to export or evaluate.
-TINY_VOCA = Path(os.environ.get("TINY_VOCA_DIR", REPO.parent)).resolve()
-WEIGHTS = Path(os.environ.get("TINY_VOCA_WEIGHTS",
-                              TINY_VOCA / "weights" if (TINY_VOCA / "weights").exists() else TINY_VOCA.parent / "models/tiny-voca"))
-sys.path.insert(0, str(TINY_VOCA / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tiny_voca_src import REPO, WEIGHTS, load_lexicon, phonemize           # noqa: E402  (also puts tiny_voca on the path)
 from tiny_voca.infer import sentences, finished                          # noqa: E402
-from tiny_voca.text import chunks, normalize_text, tokenize, parse_espeak  # noqa: E402
-
-
-def load_lexicon(path):
-    lexicon = {}
-    for line in open(path, encoding="utf-8"):
-        word, phones = line.rstrip("\n").split("\t")
-        lexicon.setdefault(word, phones.replace(" ", "_"))
-    return lexicon
-
-
-def phonemize(text, lexicon):
-    pieces, missing = [], []
-    for punctuation, piece in chunks(normalize_text(text)):
-        if punctuation:
-            pieces.append((True, piece))
-            continue
-        words = []
-        for word in piece.lower().split():
-            if word in lexicon:
-                words += parse_espeak(lexicon[word])
-            else:
-                missing.append(word)
-        pieces.append((False, words))
-    return tokenize(pieces), missing
+import tvserial                                                           # noqa: E402
 
 
 class Dizione:
@@ -62,12 +33,10 @@ class Dizione:
 
 
 class Board:
-    def __init__(self, port):
-        self.s = serial.Serial()
-        self.s.port, self.s.baudrate, self.s.timeout = port, 115200, 0.2
-        self.s.rts = False  # only RTS: DTR low with RTS high resets the S3
-        self.s.open()
+    def __init__(self, port, profile=False):
+        self.s = tvserial.open_port(port)
         self.buf = b""
+        self.profile = profile
 
     def line(self, deadline):
         while b"\n" not in self.buf:
@@ -84,7 +53,7 @@ class Board:
             line = self.line(deadline)
             if line == "READY":
                 return
-            if "Guru Meditation" in line or "abort()" in line:
+            if any(m in line for m in tvserial.PANIC):
                 raise RuntimeError(line)
 
     def synthesize(self, ids, stress, voice, seed, seconds):
@@ -102,20 +71,19 @@ class Board:
                 pcm, in_dump = base64.b64decode("".join(chunks_)), False
             elif in_dump:
                 chunks_.append(line)
-            elif line.startswith("ERR") or "Guru Meditation" in line or "abort()" in line:
+            elif line.startswith("ERR") or any(m in line for m in tvserial.PANIC):
                 raise RuntimeError(line)
             elif line == "DONE":
                 return result, pcm
-            elif line.startswith("  ") and args.profile:
+            elif line.startswith("  ") and self.profile:
                 print("   ", line.strip())
 
 
 def main():
-    global args
     parser = argparse.ArgumentParser()
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", choices=("F2", "M2"), default="M2")
-    parser.add_argument("--port", default="/dev/cu.usbmodem1201")
+    parser.add_argument("--port", default=tvserial.default_port())
     parser.add_argument("--out", default=str(REPO / "out/s3.wav"))
     parser.add_argument("--phonemizer", default=str(WEIGHTS / "phonemizer"))
     parser.add_argument("--dizione", default=str(REPO / "out/bin/dizione_cli"))
@@ -132,10 +100,11 @@ def main():
         print("(dizione_cli not built: falling back to a plain lexicon lookup)")
         lexicon = load_lexicon(str(Path(args.phonemizer) / "lexicon.tsv"))
         def to_tokens(text):
-            p, missing = phonemize(text, lexicon)
+            missing = []
+            p = phonemize(text, lexicon, missing)
             return (list(p.ids), list(p.stress)), missing
     voice = 0 if args.voice == "F2" else 1
-    board = Board(args.port)
+    board = Board(args.port, args.profile)
     board.wait_ready(30)
     pcm_all, rows, gap = [], [], int(0.25 * 24000)
     print(f"{'#':>2} {'tokens':>6} {'audio s':>7} {'synth s':>7} {'RTF':>5}  text")

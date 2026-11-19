@@ -9,8 +9,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+// kernels_s3.S (tv_attn_max48 is implemented there directly)
 void qacc_mm_s8(const int8_t *x, const int8_t *wblk, const uint8_t *raw_in, uint8_t *raw_out, int k32);
-int32_t attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m);
 int32_t attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint32_t *lut_lim, int8_t *w);
 void attn_pv64(const int8_t *w, const int8_t *v, int32_t *acc);
 
@@ -39,6 +39,8 @@ void *tv_alloc_fast(size_t n) {
 }
 
 // ---------------------------------------------------------------- QACC raw layout
+typedef uint32_t __attribute__((may_alias)) word;  // 32-bit reads of byte buffers (16-byte aligned)
+
 static void pack_qacc(const int32_t *v, uint8_t *raw) {      // 16 values (20-bit) -> 64 bytes
     memset(raw, 0, 64);
     for (int h = 0; h < 2; h++)
@@ -52,7 +54,7 @@ static void pack_qacc(const int32_t *v, uint8_t *raw) {      // 16 values (20-bi
 
 static inline void unpack_qacc(const uint8_t *raw, int32_t *o) {
     for (int h = 0; h < 2; h++, raw += 32, o += 8) {
-        const uint32_t *w = (const uint32_t *)raw;
+        const word *w = (const word *)raw;
         uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = w[4];
         o[0] = (int32_t)(w0 << 12) >> 12;
         o[1] = (int32_t)(((w0 >> 20) | (w1 << 12)) << 12) >> 12;
@@ -66,7 +68,8 @@ static inline void unpack_qacc(const uint8_t *raw, int32_t *o) {
 }
 
 // Backend data per linear: packed preloads [chunks][Npad/16][64 bytes] and the same values
-// unpacked [chunks][Npad] (NULL when there is no preload), and the per-channel output scale.
+// unpacked [chunks][Npad] (NULL when there is no preload: every layer but project, the only one
+// with chunks > 1), and the per-channel output scale.
 typedef struct {
     uint8_t *raw_pre;
     int32_t *pre;
@@ -80,10 +83,12 @@ int tv_linear_prepare(tv_linear *L) {
     int nblocks = (L->N + 15) / 16;
     backend *b = calloc(1, sizeof *b);
     if (!b) return -1;
+    L->backend = b;                             // tv_linear_release frees it, also after a failure here
     b->scale = heap_caps_malloc((size_t)nblocks * 16 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!b->scale) return -1;
     for (int n = 0; n < nblocks * 16; n++) b->scale[n] = n < L->N ? L->in_scale * L->ws[n] : 0.0f;
-    if (L->pre) {
+    if (L->pre || L->chunks > 1) {
+        if (!L->pre) return -1;                 // chunks need their centring preload
         b->raw_pre = heap_caps_aligned_alloc(16, (size_t)L->chunks * nblocks * 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         b->pre = heap_caps_malloc((size_t)L->chunks * nblocks * 16 * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!b->raw_pre || !b->pre) return -1;
@@ -94,7 +99,6 @@ int tv_linear_prepare(tv_linear *L) {
                 pack_qacc(v, b->raw_pre + ((size_t)c * nblocks + nb) * 64);
             }
     }
-    L->backend = b;
     return 0;
 }
 
@@ -132,21 +136,21 @@ static inline long rail_count(const int32_t *v, int width) {
 static inline __attribute__((always_inline)) long mm_row(const tv_linear *L, const backend *be, const int8_t *xt,
                                                          const int8_t *wb, int nb, int nblocks, int width, int32_t *total) {
     uint8_t raw[64] __attribute__((aligned(16)));
-    if (L->chunks == 1 && !be->raw_pre) {       // every layer but project
+    if (!be->raw_pre) {                         // every layer but project: one chunk from zero
         qacc_mm_s8(xt, wb, zero_raw, raw, L->K / 32);
         unpack_qacc(raw, total);
         return rail_count(total, width);
     }
     const int chunk = L->K / L->chunks;
     long sat = 0;
-    for (int c = 0; c < L->chunks; c++) {
+    for (int c = 0; c < L->chunks; c++) {       // each chunk from its preload, which is taken off again
         int32_t lanes[16];
         const size_t at = (size_t)c * nblocks + nb;
-        qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, be->raw_pre ? be->raw_pre + at * 64 : zero_raw, raw, chunk / 32);
+        qacc_mm_s8(xt + c * chunk, wb + (size_t)c * chunk * 16, be->raw_pre + at * 64, raw, chunk / 32);
         unpack_qacc(raw, lanes);
         sat += rail_count(lanes, width);
-        const int32_t *pre = be->pre ? be->pre + at * 16 : NULL;
-        for (int i = 0; i < 16; i++) total[i] = (c ? total[i] : 0) + lanes[i] - (pre ? pre[i] : 0);
+        const int32_t *pre = be->pre + at * 16;
+        for (int i = 0; i < 16; i++) total[i] = (c ? total[i] : 0) + lanes[i] - pre[i];
     }
     return sat;
 }
@@ -188,6 +192,7 @@ static void mm_run(void *arg) {
 static SemaphoreHandle_t go_sem, done_sem;
 static void (*worker_fn)(void *);
 static void *worker_arg;
+static volatile int parallel_busy;          // tv_parallel2 is not re-entrant
 
 static void worker(void *unused) {
     for (;;) {
@@ -198,19 +203,25 @@ static void worker(void *unused) {
 }
 
 void tv_parallel2(void (*fn)(void *), void *a, void *b) {
+    if (parallel_busy) { printf("tv: nested tv_parallel2\n"); abort(); }
+    parallel_busy = 1;
     worker_fn = fn;
     worker_arg = b;
     xSemaphoreGive(go_sem);
     fn(a);
     xSemaphoreTake(done_sem, portMAX_DELAY);
+    parallel_busy = 0;
 }
-
 
 void tv_kernels_init(void) {
     if (go_sem) return;
     go_sem = xSemaphoreCreateBinary();
     done_sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(worker, "tv_worker", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1);
+    if (!go_sem || !done_sem ||
+        xTaskCreatePinnedToCore(worker, "tv_worker", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1) != pdPASS) {
+        printf("tv: cannot start the worker on core 1\n");
+        abort();
+    }
 }
 
 long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const tv_epilogue *e) {
@@ -227,15 +238,13 @@ long tv_linear_run(const tv_linear *L, const int8_t *x, int T, void *out, const 
 }
 
 // ---------------------------------------------------------------- attention (one head, dim 48)
-int32_t tv_attn_max48(const int8_t *q, const int8_t *K, int n, int32_t m) { return attn_max48(q, K, n, m); }
-
 int32_t tv_attn_weights48(const int8_t *q, const int8_t *K, int n, int32_t m, const uint8_t *lut, uint32_t lim, int8_t *w) {
-    const uint32_t lut_lim[2] = {(uint32_t)lut, lim};
+    const uint32_t lut_lim[2] = {(uint32_t)(uintptr_t)lut, lim};
     return attn_weights48(q, K, n, m, lut_lim, w);
 }
 
 static inline int any_nonzero64(const int8_t *w) {
-    const uint32_t *p = (const uint32_t *)w;
+    const word *p = (const word *)w;
     uint32_t o = 0;
     for (int i = 0; i < 16; i++) o |= p[i];
     return o != 0;
